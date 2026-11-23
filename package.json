@@ -1,0 +1,280 @@
+{
+  "name": "review-agents",
+  "displayName": "Review Agents",
+  "description": "Voice-driven interactive Mermaid whiteboard walkthrough & PR/Diff code reviewer powered by ACP",
+  "version": "0.1.0",
+  "publisher": "review-agents",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/zzxzz12345/review-agents.git"
+  },
+  "homepage": "https://github.com/zzxzz12345/review-agents#readme",
+  "bugs": {
+    "url": "https://github.com/zzxzz12345/review-agents/issues"
+  },
+  "engines": {
+    "vscode": "^1.93.0"
+  },
+  "categories": [
+    "Other",
+    "AI",
+    "SCM Providers"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "reviewAgents.startReview",
+        "title": "Review Agents: Start Voice & Whiteboard Review",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "reviewAgents.exploreCurrentBranch",
+        "title": "Review Agents: Explore / Review Current Branch (No PR)",
+        "icon": "$(compass)"
+      },
+      {
+        "command": "reviewAgents.openWhiteboard",
+        "title": "Review Agents: Open/Focus Whiteboard"
+      },
+      {
+        "command": "reviewAgents.popOutWhiteboard",
+        "title": "Review Agents: Pop Out Whiteboard to New Window"
+      },
+      {
+        "command": "reviewAgents.toggleViewMode",
+        "title": "Review Agents: Toggle Diff / Source View"
+      },
+      {
+        "command": "reviewAgents.configureBitbucketToken",
+        "title": "Review Agents: Configure Bitbucket Credentials"
+      },
+      {
+        "command": "reviewAgents.configureSpeechApiKey",
+        "title": "Review Agents: Configure Speech Provider API Key"
+      },
+      {
+        "command": "reviewAgents.publishDraftNotes",
+        "title": "Review Agents: Publish Draft Notes to Bitbucket PR"
+      },
+      {
+        "command": "reviewAgents.exportReport",
+        "title": "Review Agents: Export Markdown Review Report"
+      },
+      {
+        "command": "reviewAgents.stopSession",
+        "title": "Review Agents: End Review Session"
+      },
+      {
+        "command": "reviewAgents.openLogs",
+        "title": "Review Agents: Open Usage Logs Folder"
+      },
+      {
+        "command": "reviewAgents.downloadWhisperModel",
+        "title": "Review Agents: Download Local Whisper STT Model"
+      },
+      {
+        "command": "reviewAgents.togglePause",
+        "title": "Review Agents: Pause / Resume Walkthrough"
+      },
+      {
+        "command": "reviewAgents.checkAndInstallDependencies",
+        "title": "Review Agents: Check & Auto-Install Dependencies (CLI & Models)"
+      }
+    ],
+    "configuration": {
+      "title": "Review Agents",
+      "properties": {
+        "reviewAgents.acp.profile": {
+          "type": "string",
+          "enum": [
+            "agy",
+            "claude-code",
+            "codex",
+            "gemini",
+            "custom"
+          ],
+          "default": "agy",
+          "description": "ACP Harness profile used for interactive PR/Diff walkthroughs."
+        },
+        "reviewAgents.acp.command": {
+          "type": "string",
+          "default": "",
+          "description": "Custom ACP server command (used when profile is 'custom' or to override the preset executable)."
+        },
+        "reviewAgents.acp.args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Custom ACP server CLI arguments."
+        },
+        "reviewAgents.acp.thoughtLevel": {
+          "type": "string",
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "low",
+          "description": "Reasoning effort for the ACP walkthrough session (low recommended for lowest voice latency)."
+        },
+        "reviewAgents.acp.preferredModel": {
+          "type": "string",
+          "default": "Gemini 4 Hydrogen, auto/claude-sonnet-5-5:low",
+          "description": "Preferred ACP model(s), comma-separated in priority order (defaults to Gemini 4 Hydrogen, falling back to auto/claude-sonnet-5-5:low)."
+        },
+        "reviewAgents.bitbucket.serverBaseUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Optional Bitbucket Server / Data Center base URL override (e.g., https://bitbucket.company.com)."
+        },
+        "reviewAgents.speech.ttsProvider": {
+          "type": "string",
+          "enum": [
+            "edge-neural",
+            "system-native",
+            "openai-compat"
+          ],
+          "default": "edge-neural",
+          "description": "Text-to-Speech provider."
+        },
+        "reviewAgents.speech.sttProvider": {
+          "type": "string",
+          "enum": [
+            "system-native",
+            "openai-compat"
+          ],
+          "default": "system-native",
+          "description": "Speech-to-Text provider."
+        },
+        "reviewAgents.speech.ttsVoice": {
+          "type": "string",
+          "default": "zh-CN-XiaoxiaoNeural",
+          "description": "Voice identifier for TTS synthesis."
+        },
+        "reviewAgents.speech.ttsRate": {
+          "type": "number",
+          "default": 1.1,
+          "minimum": 0.5,
+          "maximum": 2.0,
+          "description": "Playback / synthesis rate multiplier."
+        },
+        "reviewAgents.speech.sttLocale": {
+          "type": "string",
+          "default": "zh-CN",
+          "description": "Locale used for Speech-to-Text recognition."
+        },
+        "reviewAgents.speech.whisperModelPath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional path to a local ggml-*.bin model file for whisper-cli."
+        },
+        "reviewAgents.speech.cloudBaseUrl": {
+          "type": "string",
+          "default": "https://api.openai.com/v1",
+          "description": "OpenAI-compatible API base URL for cloud TTS/STT."
+        },
+        "reviewAgents.speech.cloudTtsModel": {
+          "type": "string",
+          "default": "tts-1",
+          "description": "Cloud TTS model name."
+        },
+        "reviewAgents.speech.cloudSttModel": {
+          "type": "string",
+          "default": "whisper-1",
+          "description": "Cloud STT model name."
+        },
+        "reviewAgents.voice.interactionMode": {
+          "type": "string",
+          "enum": [
+            "vad",
+            "ptt"
+          ],
+          "default": "vad",
+          "description": "Voice interaction mode: full-duplex VAD barge-in or Push-to-Talk (Option / Alt key)."
+        },
+        "reviewAgents.voice.vadBargeInMs": {
+          "type": "number",
+          "default": 300,
+          "minimum": 100,
+          "maximum": 1500,
+          "description": "Continuous speech duration (ms) required to trigger barge-in during playback."
+        },
+        "reviewAgents.voice.vadSilenceMs": {
+          "type": "number",
+          "default": 900,
+          "minimum": 300,
+          "maximum": 3000,
+          "description": "Trailing silence duration (ms) to finalize a voice utterance."
+        },
+        "reviewAgents.context.maxContextChars": {
+          "type": "number",
+          "default": 12000,
+          "minimum": 4000,
+          "maximum": 120000,
+          "description": "Maximum character budget for the pre-analyzed Review Context Pack (smaller = faster TTFT)."
+        },
+        "reviewAgents.context.ignorePatterns": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "package-lock.json",
+            "pnpm-lock.yaml",
+            "yarn.lock",
+            "Cargo.lock",
+            "go.sum",
+            "*.lock",
+            "dist/**",
+            "build/**",
+            "*.min.js",
+            "*.pb.go",
+            "*.generated.*"
+          ],
+          "description": "Glob-like file patterns collapsed during pre-analysis to save context budget."
+        },
+        "reviewAgents.logging.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Record structured JSONL usage telemetry logs (latencies, token usage, barge-ins, Mermaid errors) for optimization."
+        },
+        "reviewAgents.logging.directory": {
+          "type": "string",
+          "default": "",
+          "description": "Optional directory path for JSONL usage logs. Defaults to VS Code extension globalStorage/logs."
+        },
+        "reviewAgents.setup.autoInstallDependencies": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically install missing local CLI dependencies (sox, whisper-cpp) and the local Whisper speech model (ggml-small-q5_1.bin)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "install:all": "npm install && npm --prefix webview-ui install",
+    "build:ext": "node esbuild.mjs",
+    "build:webview": "npm --prefix webview-ui run build",
+    "build": "npm run build:ext && npm run build:webview",
+    "watch:ext": "node esbuild.mjs --watch",
+    "typecheck": "tsc --noEmit && npm --prefix webview-ui run typecheck",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "msedge-tts": "^2.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/vscode": "^1.93.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.7.0",
+    "vitest": "^2.1.8"
+  }
+}

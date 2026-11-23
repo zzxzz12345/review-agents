@@ -341,7 +341,10 @@ export function formatContextPackForPrompt(
     }
   }
 
-  lines.push('\n## Recommended Walkthrough Chapters');
+  lines.push('\n## Recommended Walkthrough Chapters (Organize as an End-to-End Story / Feature)');
+  lines.push(
+    '- Connect these changes into a cohesive Story / Feature flow from entry trigger to final outcome: summarize unchanged bridge code briefly (1 sentence), and walk through modified/core code segments line by line.'
+  );
   for (const ch of pack.chapters) {
     lines.push(
       `- Chapter ${ch.index}/${pack.chapters.length}: ${ch.title} (${ch.files.slice(0, 6).join(', ')})`
@@ -456,7 +459,7 @@ function formatBranchExploreContextPack(
   }
 
   lines.push(
-    '\n## Inspection Guidance\n- This session inspects the current branch directly (no PR diff). Use `fs/read_text_file` selectively on the 2~5 most relevant files to verify exact class names, methods, and line numbers before jumping with `<code_goto ... view="source"/>`.'
+    '\n## Inspection Guidance\n- This session inspects the current branch directly (no PR diff). Connect the code into an end-to-end Story / Feature flow from entry trigger to outcome: summarize peripheral glue briefly (~1 sentence) and walk through core/target logic line by line. Use `fs/read_text_file` selectively on the 2~5 most relevant files to verify exact class names, methods, and line numbers before jumping with `<code_goto ... view="source"/>`.'
   );
 
   return lines.join('\n');

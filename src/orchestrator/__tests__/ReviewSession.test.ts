@@ -12,11 +12,18 @@ import type {
   UtteranceSegment,
 } from '../../shared/protocol';
 import {
+  buildAutoContinuePrompt,
+  buildBranchExploreInitialPrompt,
+  buildBranchExploreSystemPrompt,
   buildCorePathLineReviewInitialPrompt,
   buildCorePathLineReviewSystemPrompt,
+  buildInitialWalkthroughPrompt,
+  buildInterruptionPrompt,
   buildUserFollowUpPrompt,
+  buildWalkthroughSystemPrompt,
   detectActionNoteIntent,
 } from '../PromptTemplates';
+import { formatContextPackForPrompt } from '../../context/ContextPackBuilder';
 import {
   calibrateNodeLineFromContent,
   isNoiseCallerPath,
@@ -2476,5 +2483,177 @@ describe('ReviewSession orchestration & exact barge-in', () => {
     expect(sendPromptSpy).toHaveBeenCalledTimes(3);
 
     session.dispose();
+  });
+
+  it('frames PR diff and branch review prompts around end-to-end Story line-by-line walkthroughs', () => {
+    const diffSystem = buildWalkthroughSystemPrompt();
+    expect(diffSystem).toContain('Story / Feature');
+    expect(diffSystem).toContain('未修改代码');
+    expect(diffSystem).toContain('重点逐行串讲');
+    expect(diffSystem).toContain('自动跳入关键子方法');
+    expect(diffSystem).toContain('<walkthrough_done/>');
+
+    const diffInit = buildInitialWalkthroughPrompt('## Summary');
+    expect(diffInit).toContain('Story / Feature 主线');
+    expect(diffInit).toContain('未改部分简略串联');
+    expect(diffInit).toContain('2~8 行');
+
+    const branchSystem = buildBranchExploreSystemPrompt();
+    expect(branchSystem).toContain('Story / Feature');
+    expect(branchSystem).toContain('外围桥接/辅助样板代码');
+    expect(branchSystem).toContain('重点逐行串讲');
+    expect(branchSystem).toContain('自动跳入关键子方法');
+
+    const branchInitTargeted = buildBranchExploreInitialPrompt('## Repo', '审查下单幂等流程');
+    expect(branchInitTargeted).toContain('Story / Feature 执行链路');
+    expect(branchInitTargeted).toContain('外围简略串联 -> 核心代码逐行深讲');
+
+    const branchInitOverview = buildBranchExploreInitialPrompt('## Repo');
+    expect(branchInitOverview).toContain('Story 主链路');
+    expect(branchInitOverview).toContain('2~8 行');
+
+    const diffAutoContinue = buildAutoContinuePrompt({
+      mode: 'diff',
+      lastEditorFile: 'src/order.ts',
+      lastEditorLines: { start: 20, end: 26 },
+      chunkNumber: 2,
+    });
+    expect(diffAutoContinue).toContain('PR Story / Feature 主链路');
+    expect(diffAutoContinue).toContain('未改简略、已改逐行深讲');
+    expect(diffAutoContinue).toContain('自动跳入关键子方法');
+
+    const branchAutoContinue = buildAutoContinuePrompt({
+      mode: 'branch-explore',
+      lastEditorFile: 'src/order.ts',
+      lastEditorLines: { start: 20, end: 26 },
+      chunkNumber: 3,
+    });
+    expect(branchAutoContinue).toContain('Story / Feature 执行链路');
+    expect(branchAutoContinue).toContain('外围桥接/样板逻辑');
+    expect(branchAutoContinue).toContain('2~8 行');
+
+    const interruptionDiff = buildInterruptionPrompt(
+      {
+        turnId: 1,
+        spokenAlready: '刚刚看到这里',
+        unspokenCutOff: '',
+        diagramId: 'overview',
+        stackPath: 'overview',
+      },
+      '继续',
+      undefined,
+      'diff'
+    );
+    expect(interruptionDiff).toContain('PR Story 执行链路');
+    expect(interruptionDiff).toContain('2~8 行');
+
+    const interruptionBranch = buildInterruptionPrompt(
+      {
+        turnId: 2,
+        spokenAlready: '刚刚看到这里',
+        unspokenCutOff: '',
+        diagramId: 'overview',
+        stackPath: 'overview',
+      },
+      '继续',
+      undefined,
+      'branch-explore'
+    );
+    expect(interruptionBranch).toContain('Story / Feature 执行链路');
+
+    const followUpDiff = buildUserFollowUpPrompt('继续往下', {
+      diagramId: 'overview',
+      mode: 'diff',
+    });
+    expect(followUpDiff).toContain('PR Story 逐行串讲');
+
+    const followUpBranch = buildUserFollowUpPrompt('继续往下', {
+      diagramId: 'overview',
+      mode: 'branch-explore',
+    });
+    expect(followUpBranch).toContain('Story 逐行串讲');
+
+    const formattedDiffPack = formatContextPackForPrompt({
+      target: {
+        kind: 'local-diff',
+        repoRoot: '/tmp/repo',
+        baseRef: 'main',
+        effectiveBaseRef: 'main',
+        headRef: 'HEAD',
+        title: 'Local Diff',
+        subtitle: 'main..HEAD',
+      },
+      generatedAt: '2026-11-23T00:00:00Z',
+      commits: [],
+      totalFilesChanged: 1,
+      includedFilesCount: 1,
+      ignoredFilesCount: 0,
+      totalAdditions: 5,
+      totalDeletions: 2,
+      files: [],
+      moduleClusters: [
+        {
+          moduleGroup: 'core',
+          fileCount: 1,
+          additions: 5,
+          deletions: 2,
+          files: ['src/order.ts'],
+        },
+      ],
+      chapters: [
+        {
+          index: 1,
+          title: 'Core Flow',
+          moduleGroup: 'core',
+          summary: '1 file',
+          files: ['src/order.ts'],
+        },
+      ],
+    });
+    expect(formattedDiffPack).toContain(
+      'Recommended Walkthrough Chapters (Organize as an End-to-End Story / Feature)'
+    );
+
+    const formattedBranchPack = formatContextPackForPrompt({
+      target: {
+        kind: 'branch-explore',
+        repoRoot: '/tmp/repo',
+        branchName: 'main',
+        baseRef: 'HEAD',
+        effectiveBaseRef: 'HEAD',
+        headRef: 'HEAD',
+        title: 'Current Branch',
+        subtitle: 'main',
+        startMode: 'auto-overview',
+      },
+      generatedAt: '2026-11-23T00:00:00Z',
+      commits: [],
+      totalFilesChanged: 1,
+      includedFilesCount: 1,
+      ignoredFilesCount: 0,
+      totalAdditions: 0,
+      totalDeletions: 0,
+      files: [],
+      moduleClusters: [],
+      chapters: [
+        {
+          index: 1,
+          title: 'Entry',
+          moduleGroup: 'src',
+          summary: '1 file',
+          files: ['src/index.ts'],
+        },
+      ],
+      repoOverview: {
+        branchName: 'main',
+        totalTrackedFiles: 1,
+        includedFiles: 1,
+        ignoredFiles: 0,
+        directorySummaries: ['src (1 file)'],
+        keyDocs: [],
+        workingTreeChanges: [],
+      },
+    });
+    expect(formattedBranchPack).toContain('end-to-end Story / Feature flow');
   });
 });

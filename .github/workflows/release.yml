@@ -1,0 +1,134 @@
+name: Release VSIX
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      prerelease:
+        description: Mark release as pre-release
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            webview-ui/package-lock.json
+
+      - name: Install dependencies
+        run: |
+          npm ci
+          npm --prefix webview-ui ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Run unit tests
+        run: CI=true npm test
+
+      - name: Build extension and webview
+        run: npm run build
+
+      - name: Package VSIX
+        id: package
+        run: |
+          NAME="$(node -p "require('./package.json').name")"
+          VERSION="$(node -p "require('./package.json').version")"
+          TAG="v${VERSION}"
+          VSIX="${NAME}-${VERSION}.vsix"
+          SHA256_FILE="${VSIX}.sha256"
+
+          npx --yes @vscode/vsce package --no-dependencies -o "$VSIX"
+          sha256sum "$VSIX" > "$SHA256_FILE"
+
+          {
+            echo "version=$VERSION"
+            echo "tag=$TAG"
+            echo "vsix=$VSIX"
+            echo "sha256_file=$SHA256_FILE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload VSIX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-agents-vsix
+          retention-days: 30
+          path: |
+            ${{ steps.package.outputs.vsix }}
+            ${{ steps.package.outputs.sha256_file }}
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.package.outputs.tag }}
+          VERSION: ${{ steps.package.outputs.version }}
+          VSIX: ${{ steps.package.outputs.vsix }}
+          SHA256_FILE: ${{ steps.package.outputs.sha256_file }}
+          PRERELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.prerelease || 'false' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git tag -f "$TAG" "$GITHUB_SHA"
+          git push -f origin "refs/tags/$TAG"
+
+          SHORT_SHA="$(git rev-parse --short "$GITHUB_SHA")"
+          CHECKSUM="$(cat "$SHA256_FILE")"
+          RECENT_CHANGES="$(git log -n 10 --pretty=format:'- %h %s (%an)')"
+
+          cat > release-notes.md <<EOF
+          ## Review Agents ${TAG}
+
+          - **Version**: \`${VERSION}\`
+          - **Commit**: \`${SHORT_SHA}\`
+          - **Package**: \`${VSIX}\`
+
+          ### SHA-256
+          \`\`\`
+          ${CHECKSUM}
+          \`\`\`
+
+          ### Install
+          \`\`\`bash
+          code --install-extension ${VSIX} --force
+          \`\`\`
+
+          ### Recent Commits
+          ${RECENT_CHANGES}
+          EOF
+
+          FLAGS=()
+          if [ "$PRERELEASE" = "true" ]; then
+            FLAGS+=(--prerelease)
+          else
+            FLAGS+=(--latest)
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$VSIX" "$SHA256_FILE" --clobber
+            gh release edit "$TAG" --title "Review Agents ${TAG}" --notes-file release-notes.md "${FLAGS[@]}"
+          else
+            gh release create "$TAG" "$VSIX" "$SHA256_FILE" --title "Review Agents ${TAG}" --notes-file release-notes.md "${FLAGS[@]}"
+          fi

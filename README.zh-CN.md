@@ -6,6 +6,14 @@
 
 ---
 
+## 演示视频（Demo）
+
+[![Review Agents 中文双屏语音导读 Demo](docs/demo/preview-zh.png)](docs/demo/review-agents-demo.mp4)
+
+> **[观看中文双屏语音导读 Demo（MP4，含 Edge Neural TTS 语音讲解）](docs/demo/review-agents-demo.mp4)** —— 以当前仓库为实例，演示左侧源码 ≤10 行居中高亮跳转、右侧 L1→L2 交互式 Mermaid 时序图与 Note、右侧主调用链导读栏 + LSP 调用方展开、`Space` 暂停打断提问与自动 Action 批注捕获。
+
+---
+
 ## 核心特性
 
 ### 1. 三种导读与 Review 模式

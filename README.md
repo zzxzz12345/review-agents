@@ -6,6 +6,14 @@
 
 ---
 
+## Demo
+
+[![Review Agents English Dual-Pane Demo](docs/demo/preview-en.png)](docs/demo/review-agents-demo-en.mp4)
+
+> **[Watch English Dual-Pane Walkthrough Demo (MP4, with Edge Neural TTS narration)](docs/demo/review-agents-demo-en.mp4)** — Showcases live dual-pane VS Code navigation on this repository: top-down L1→L2 Mermaid `sequenceDiagram` + Notes, ≤10-line centered source highlights, right-hand hybrid Agent + LSP incoming call-chain exploration, `Space` pause/resume, and automatic Action Note capture.
+
+---
+
 ## Key Features
 
 ### 1. Three Review & Exploration Modes

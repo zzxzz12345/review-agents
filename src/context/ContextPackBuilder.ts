@@ -90,30 +90,30 @@ export class ContextPackBuilder {
       return b.additions + b.deletions - (a.additions + a.deletions);
     });
 
+    const MAX_SYMBOL_PROBE_FILES = 120;
     let remainingBudget = maxContextChars;
     const files: FileChangeSummary[] = [];
-    let symbolProbeCount = 0;
+    const probeQueue: Array<{ index: number; file: (typeof sorted)[number] }> = [];
 
     for (const file of sorted) {
       let hunkHeaders: string[] = [];
       let touchedSymbols: string[] | undefined;
       let compactDiff = '';
 
-      if (!file.isIgnored && !file.isBinary && (remainingBudget > 300 || symbolProbeCount < 25)) {
-        symbolProbeCount += 1;
-        const patch = await this.gitService.getFilePatch(
-          target.repoRoot,
-          target.effectiveBaseRef,
-          target.headRef,
-          file.path,
-          2
-        );
-        hunkHeaders = extractHunkHeaders(patch);
-        const extracted = extractTouchedSymbols(patch);
-        if (extracted.length > 0) {
-          touchedSymbols = extracted;
-        }
+      if (!file.isIgnored && !file.isBinary) {
         if (remainingBudget > 300) {
+          const patch = await this.gitService.getFilePatch(
+            target.repoRoot,
+            target.effectiveBaseRef,
+            target.headRef,
+            file.path,
+            2
+          );
+          hunkHeaders = extractHunkHeaders(patch);
+          const extracted = extractTouchedSymbols(patch);
+          if (extracted.length > 0) {
+            touchedSymbols = extracted;
+          }
           const strippedPatch = stripGitPatchHeader(patch);
           const perFileLimit = Math.min(2800, Math.max(400, Math.floor(remainingBudget * 0.35)));
           if (strippedPatch.length <= perFileLimit) {
@@ -122,6 +122,8 @@ export class ContextPackBuilder {
             compactDiff = `${strippedPatch.slice(0, perFileLimit)}\n... [truncated, use fs/read_text_file for full context]`;
           }
           remainingBudget -= compactDiff.length;
+        } else if (files.length < MAX_SYMBOL_PROBE_FILES) {
+          probeQueue.push({ index: files.length, file });
         }
       }
 
@@ -131,6 +133,28 @@ export class ContextPackBuilder {
         touchedSymbols,
         compactDiff,
       });
+    }
+
+    // Populate hunk/symbol line indices for remaining files in bounded parallel batches
+    const PROBE_BATCH_SIZE = 8;
+    for (let i = 0; i < probeQueue.length; i += PROBE_BATCH_SIZE) {
+      const batch = probeQueue.slice(i, i + PROBE_BATCH_SIZE);
+      await Promise.all(
+        batch.map(async ({ index, file }) => {
+          const patch = await this.gitService.getFilePatch(
+            target.repoRoot,
+            target.effectiveBaseRef,
+            target.headRef,
+            file.path,
+            0
+          );
+          files[index].hunkHeaders = extractHunkHeaders(patch);
+          const extracted = extractTouchedSymbols(patch);
+          if (extracted.length > 0) {
+            files[index].touchedSymbols = extracted;
+          }
+        })
+      );
     }
 
     const clusterMap = new Map<

@@ -234,4 +234,59 @@ describe('GitService and ContextPackBuilder', () => {
     expect(promptMd).toContain('# Order Engine');
     expect(promptMd).toContain('## Local Uncommitted Changes (git status)');
   });
+
+  it('still probes hunkHeaders and touchedSymbols beyond file #25 when maxContextChars budget is small', async () => {
+    const repoDir = await fs.mkdtemp(path.join(os.tmpdir(), 'ra-large-pr-'));
+    tempDirs.push(repoDir);
+
+    await git(repoDir, ['init', '-b', 'main']);
+    await git(repoDir, ['config', 'user.email', 'test@example.com']);
+    await git(repoDir, ['config', 'user.name', 'Test User']);
+
+    await fs.mkdir(path.join(repoDir, 'src'), { recursive: true });
+    const padding = Array.from({ length: 18 }, (_, j) => `x_${j} = ${j}`).join('\n');
+
+    for (let i = 1; i <= 30; i++) {
+      await fs.writeFile(
+        path.join(repoDir, 'src', `mod_${String(i).padStart(2, '0')}.py`),
+        `${padding}\ndef process_${i}():\n    return ${i}\n`,
+        'utf8'
+      );
+    }
+    await git(repoDir, ['add', '.']);
+    await git(repoDir, ['commit', '-m', 'chore: init 30 files']);
+
+    await git(repoDir, ['checkout', '-b', 'feat/large-pr']);
+    for (let i = 1; i <= 30; i++) {
+      await fs.writeFile(
+        path.join(repoDir, 'src', `mod_${String(i).padStart(2, '0')}.py`),
+        `${padding}\ndef process_${i}(event):\n    return ${i} + 1\n`,
+        'utf8'
+      );
+    }
+    await git(repoDir, ['add', '.']);
+    await git(repoDir, ['commit', '-m', 'feat: update all 30 files']);
+
+    const gitService = new GitService();
+    const builder = new ContextPackBuilder(gitService);
+    const pack = await builder.build(
+      {
+        kind: 'local-diff',
+        repoRoot: repoDir,
+        baseRef: 'main',
+        effectiveBaseRef: 'main',
+        headRef: 'HEAD',
+        title: 'Large PR',
+        subtitle: 'main..HEAD',
+      },
+      { maxContextChars: 400 }
+    );
+
+    expect(pack.files.length).toBe(30);
+    // Files past budget and past #25 must still carry hunkHeaders & touchedSymbols
+    for (const file of pack.files) {
+      expect(file.hunkHeaders.length).toBeGreaterThan(0);
+      expect(file.touchedSymbols && file.touchedSymbols.length).toBeGreaterThan(0);
+    }
+  });
 });

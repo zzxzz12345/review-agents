@@ -10,7 +10,11 @@ import type {
 } from '../shared/protocol';
 import { buildGitUri } from './GitContentProvider';
 import { WhiteboardPanel } from './WhiteboardPanel';
-import { MAX_HIGHLIGHT_LINES, clampHighlightRange } from './highlightRange';
+import {
+  MAX_HIGHLIGHT_LINES,
+  clampHighlightRange,
+  recalibrateTopBoilerplateRange,
+} from './highlightRange';
 
 export class CodeNavigator {
   private preferredViewMode: CodeViewMode;
@@ -95,7 +99,7 @@ export class CodeNavigator {
     cmd: CodeGotoDirective,
     target: ReviewTarget,
     whiteboardPanel: WhiteboardPanel,
-    options?: { preferWorkspaceFile?: boolean }
+    options?: { preferWorkspaceFile?: boolean; preferredLines?: LineRange }
   ): Promise<EditorLocationState> {
     const cleanRel = cmd.file.replace(/\\/g, '/').replace(/^\/+/, '');
     const effectiveView = cmd.view ?? this.preferredViewMode;
@@ -156,15 +160,27 @@ export class CodeNavigator {
       : undefined;
 
     const editor = await this.findVisibleEditor(focusUri);
+    let finalLines = effectiveLines;
     if (editor && effectiveLines) {
-      this.applyLineHighlight(editor, effectiveLines, cmd.label);
+      const headLineCount = Math.min(editor.document.lineCount, 250);
+      const headLines: string[] = [];
+      for (let i = 0; i < headLineCount; i++) {
+        headLines.push(editor.document.lineAt(i).text);
+      }
+      finalLines = recalibrateTopBoilerplateRange(headLines, effectiveLines, {
+        label: cmd.label,
+        preferredLines: options?.preferredLines,
+        maxLines: MAX_HIGHLIGHT_LINES,
+        totalLineCount: editor.document.lineCount,
+      });
+      this.applyLineHighlight(editor, finalLines, cmd.label);
     } else if (editor) {
       this.clearDecorations(editor);
     }
 
     const location: EditorLocationState = {
       file: cleanRel,
-      lines: effectiveLines,
+      lines: finalLines,
       view: effectiveView,
       label: cmd.label,
     };

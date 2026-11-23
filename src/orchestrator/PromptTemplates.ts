@@ -53,7 +53,7 @@ export function buildWalkthroughSystemPrompt(): string {
    - **编辑器代码跳转（每步联动源码 + 严格 ≤10 行局部框选）**：
      \`<code_goto file="src/auth.ts" lines="40-47" label="AuthService.refreshToken — 并发锁判断"/>\`
      - **每步必看源码**：凡是讲解涉及具体文件、入口、类定义、数据结构或代码逻辑，必须在对应口播句紧前面发 \`<code_goto>\` 打开真实源码。
-     - **严控高亮不超过 10 行**：\`lines="start-end"\` **单次跨度必须 ≤10 行（推荐 3~8 行）**！严禁把几十行的整个函数或整个文件一次性全部框出来（会导致重点落在第二屏）。讲解较长方法时，应按口播进度分句分段发多个 \`<code_goto>\`（例如先 \`lines="42-48"\` 讲校验，下一句 \`lines="56-63"\` 讲核心写入）。
+     - **严控高亮不超过 10 行 & 严禁盲猜文件顶部 \`1-8\`**：\`lines="start-end"\` **单次跨度必须 ≤10 行（推荐 3~8 行）**！**严禁**在缺少行号时猜测 \`lines="1-8"\` 或框选文件顶部的 \`import\` 声明头；如果 Context Pack 未列出某文件的 Hunk/符号行号，**必须先用 \`read_text_file\` 查明真实业务逻辑行号后再发 \`<code_goto>\`**（仅顺带提及的外围文件名可纯口播不盲跳）。讲解较长方法时，应按口播进度分句分段发多个 \`<code_goto>\`（例如先 \`lines="42-48"\` 讲校验，下一句 \`lines="56-63"\` 讲核心写入）。
      - \`view\` 选择规则：编辑器会遵循用户的默认偏好视图（默认为 \`"source"\` 源码视图，可随时切换并记忆）；常规跳转可省略 \`view\` 以沿用用户偏好，仅在明确需要展示**未改动文件**、上游调用方或上下文源码时显式写 \`view="source"\`，只有在需要对比局部改动的 Diff 块且用户处于 Diff 偏好时才用 \`view="diff"\`。
    - **语音记笔记 / Review 批注**：
      \`<review_note file="src/auth.ts" line="55" severity="action|issue|warning|info">异常分支未释放 refreshLock</review_note>\`
@@ -113,7 +113,7 @@ export function buildBranchExploreSystemPrompt(): string {
      - flowchart 中含空格/括号/冒号/斜杠的节点文字用双引号包裹；\`map\` 中的行范围也控制在 10 行以内。
    - \`<wb_focus id="NodeId"/>\`、\`<wb_pop/>\`、\`<wb_clear/>\`
    - **编辑器代码跳转（每步联动源码且 ≤10 行）**：\`<code_goto file="path/to/file.ts" lines="start-end" view="source" label="类名.方法名 — 局部逻辑"/>\`
-     - 讲到任何具体文件或逻辑都必须发 \`<code_goto>\`；单次 \`lines\` 跨度 **必须 1~10 行（推荐 3~8 行）**，保证高亮代码完整居中落在当前一屏；讲解长函数时请拆成多个 \`<code_goto>\` 随句滚动高亮；当前分支导读请始终使用 \`view="source"\` 或省略 \`view\`。
+     - 讲到任何具体文件或逻辑都必须发 \`<code_goto>\`；单次 \`lines\` 跨度 **必须 1~10 行（推荐 3~8 行）**，保证高亮代码完整居中落在当前一屏；**严禁**猜测 \`lines="1-8"\` 或高亮文件顶部 \`import\` 声明头（未读到行号前先 \`read_text_file\` 核实真实行号再跳转）；讲解长函数时请拆成多个 \`<code_goto>\` 随句滚动高亮；当前分支导读请始终使用 \`view="source"\` 或省略 \`view\`。
    - \`<review_note file="path/to/file.ts" line="55" severity="action|issue|warning|info">问题描述或 Action</review_note>\`
    - **主调用链导读栏（右侧栏自顶向下展示主链路，自动滤掉不重要方法）**：
      切入具体模块或方法讲解时，输出 1 段紧扣当前主题的 **2~6 步精简主调用链**（过滤 getter/logger/helper/测试），用 \`* \` 标出当前正讲节点：
@@ -164,7 +164,7 @@ export function buildCorePathLineReviewSystemPrompt(): string {
      先基于 Context Pack 并按需调用 \`read_text_file\` 查证用户输入入口及 1~4 个直接下游主干文件。在首句之前输出 \`<chapter index="1" total="4" title="L1 核心链路与入口"/>\`、一张概括该输入在系统中流转的主干图 \`<wb_render id="core_path" title="核心链路：..." mode="replace" map='...'>\`（4~7 个主干节点，选择最合适的图表类型如 \`sequenceDiagram\` / \`flowchart TD\` / \`stateDiagram-v2\` + Note），以及对应的 \`<call_chain title="...">\`（2~6 个核心业务步骤，用 \`* \` 标当前步骤）。
    - **逐行分段 Review（严控每次 2~8 行，绝对 ≤10 行）**：
      从入口方法开始，沿着真实代码执行顺序**自上而下逐段往前走**：每次只聚焦**一个核心分支判断（if/switch/guard/try-catch）、一次关键状态更新或一处关键方法调用**。
-     每次讲解紧前面必须输出 \`<code_goto file="..." lines="start-end" view="source" label="类名.方法名 — 本段逻辑"/>\`（\`lines\` 跨度严格 **2~8 行**，确保源码完整居中在当前一屏）。自动跳过无意义的 getter/日志/纯样板代码，只逐行扫核心分支与调用逻辑。
+     每次讲解紧前面必须输出 \`<code_goto file="..." lines="start-end" view="source" label="类名.方法名 — 本段逻辑"/>\`（\`lines\` 跨度严格 **2~8 行**，确保源码完整居中在当前一屏；**严禁**未查证行号就盲猜 \`lines="1-8"\` 停在文件顶部 \`import\` 区）。自动跳过无意义的 getter/日志/纯样板代码，只逐行扫核心分支与调用逻辑。
    - **自动跳入关键子方法 + 按需深化白板层级（严格 L1~L4）**：
      1) 当逐行走到一个**关键业务子方法调用**时，先在调用行发 \`<code_goto>\` 交代参数与调用意图，然后**自动跳入该子方法内部**继续往下审：更新 \`<call_chain>\`（保留上游主链并追加/标 \`* \` 当前子方法）并立刻发 \`<code_goto file="子方法文件" lines="a-b" view="source" label="SubClass.method — 核心分支"/>\`。
      2) **按需深化白板**：

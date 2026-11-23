@@ -30,11 +30,15 @@ import {
   matchActiveCallChainNode,
 } from '../callChainUtils';
 import {
+  resolveBestDefaultLinesForFile,
   resolveCodeGotoView,
   ReviewSession,
   type ReviewSessionRuntimeConfig,
 } from '../ReviewSession';
-import { clampHighlightRange } from '../../vscode-ui/highlightRange';
+import {
+  clampHighlightRange,
+  recalibrateTopBoilerplateRange,
+} from '../../vscode-ui/highlightRange';
 
 const BASE_CONFIG: ReviewSessionRuntimeConfig = {
   acpProfile: { id: 'agy', displayName: 'Antigravity', command: 'agy', args: ['acp'] },
@@ -2655,5 +2659,121 @@ describe('ReviewSession orchestration & exact barge-in', () => {
       },
     });
     expect(formattedBranchPack).toContain('end-to-end Story / Feature flow');
+  });
+
+  it('recalibrates top-of-file import boilerplate highlights and resolves smart default hunk lines', () => {
+    const pyLines = [
+      'from __future__ import annotations',
+      '',
+      'import argparse',
+      'from datetime import date, timezone',
+      'from typing import TypedDict, cast',
+      '',
+      'from backtest_framework.entity.enums import (',
+      '    MarketEvent,',
+      '    OrderType,',
+      '    PriceType,',
+      '    TimeInForce,',
+      ')',
+      '',
+      'LOGGER = None',
+      'class V84SftKronos:',
+      '    def run(self):',
+      '        return True',
+      ...Array.from({ length: 185 }, (_, i) => `    # body line ${i + 18}`),
+    ];
+
+    // 1. Relocates top import range (1-8) to preferredLines (179-186) when known
+    expect(
+      recalibrateTopBoilerplateRange(
+        pyLines,
+        { start: 1, end: 8 },
+        {
+          label: 'v84_sft_kronos.py — 独立 Kronos 策略接入',
+          preferredLines: { start: 179, end: 186 },
+        }
+      )
+    ).toEqual({ start: 179, end: 186 });
+
+    // 2. Relocates to first symbol declaration (class V84SftKronos at L15) when no preferredLines
+    expect(recalibrateTopBoilerplateRange(pyLines, { start: 1, end: 8 })).toEqual({
+      start: 15,
+      end: 22,
+    });
+
+    // 3. Keeps SQL / config files whose real content starts at line 1 untouched
+    const sqlLines = [
+      'CREATE TABLE engine_event_consumption (',
+      '    id BIGSERIAL PRIMARY KEY,',
+      '    event_id TEXT NOT NULL,',
+      '    created_at TIMESTAMPTZ NOT NULL',
+      ');',
+      'CREATE INDEX idx_event_id ON engine_event_consumption(event_id);',
+      'SELECT 1;',
+      'SELECT 2;',
+      'SELECT 3;',
+    ];
+    expect(recalibrateTopBoilerplateRange(sqlLines, { start: 1, end: 8 })).toEqual({
+      start: 1,
+      end: 8,
+    });
+
+    // 4. Keeps explicit import/header labels untouched
+    expect(
+      recalibrateTopBoilerplateRange(
+        pyLines,
+        { start: 1, end: 8 },
+        {
+          label: 'Import 依赖声明调整',
+          preferredLines: { start: 179, end: 186 },
+        }
+      )
+    ).toEqual({ start: 1, end: 8 });
+
+    // 5. Keeps non-top ranges unchanged
+    expect(
+      recalibrateTopBoilerplateRange(
+        pyLines,
+        { start: 60, end: 68 },
+        { preferredLines: { start: 179, end: 186 } }
+      )
+    ).toEqual({ start: 60, end: 68 });
+
+    // 6. resolveBestDefaultLinesForFile prefers non-import hunk (>15) over top import hunk
+    const resolved = resolveBestDefaultLinesForFile('libs/strategy/v84.py', {
+      target: {
+        kind: 'local-diff',
+        repoRoot: '/tmp/repo',
+        baseRef: 'main',
+        effectiveBaseRef: 'main',
+        headRef: 'HEAD',
+        title: 'Local',
+        subtitle: 'main..HEAD',
+      },
+      generatedAt: '2026-11-23T00:00:00Z',
+      commits: [],
+      totalFilesChanged: 1,
+      includedFilesCount: 1,
+      ignoredFilesCount: 0,
+      totalAdditions: 12,
+      totalDeletions: 2,
+      moduleClusters: [],
+      chapters: [],
+      files: [
+        {
+          path: 'libs/strategy/v84.py',
+          status: 'M',
+          additions: 12,
+          deletions: 2,
+          isBinary: false,
+          isIgnored: false,
+          moduleGroup: 'libs',
+          hunkHeaders: ['@@ -1,4 +1,8 @@', '@@ -175,6 +179,14 @@ class V84'],
+          touchedSymbols: ['def _on_split (L179)'],
+          compactDiff: '',
+        },
+      ],
+    });
+    expect(resolved).toEqual({ start: 179, end: 186 });
   });
 });

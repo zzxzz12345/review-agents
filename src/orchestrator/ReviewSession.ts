@@ -120,7 +120,7 @@ export interface ReviewSessionDependencies {
     navigateTo: (
       cmd: CodeGotoDirective,
       target: ReviewTarget,
-      options?: { preferWorkspaceFile?: boolean }
+      options?: { preferWorkspaceFile?: boolean; preferredLines?: LineRange }
     ) => Promise<EditorLocationState>;
     toggleViewMode: (target: ReviewTarget | undefined) => Promise<CodeViewMode>;
     getCurrentViewMode: () => CodeViewMode;
@@ -2374,15 +2374,24 @@ export class ReviewSession {
           this.contextPack,
           this.deps.codeNavigator.getCurrentViewMode()
         );
-        await this.deps.codeNavigator.navigateTo(
+        const preferredLines =
+          !dir.lines || dir.lines.start <= 5
+            ? resolveBestDefaultLinesForFile(dir.file, this.contextPack)
+            : undefined;
+        const navigated = await this.deps.codeNavigator.navigateTo(
           { ...dir, view },
           this.target,
-          { preferWorkspaceFile: !isModifiedFile }
+          preferredLines
+            ? { preferWorkspaceFile: !isModifiedFile, preferredLines }
+            : { preferWorkspaceFile: !isModifiedFile }
         );
         if (!hasExplicitWbUpdate) {
           this.syncWhiteboardFocusForFile(dir.file);
         }
-        this.syncCallChainActiveForLocation(dir.file, dir.lines?.start);
+        this.syncCallChainActiveForLocation(
+          dir.file,
+          navigated?.lines?.start ?? dir.lines?.start
+        );
         this.emitSessionState(this.phase);
       } else if (dir.type === 'walkthrough_done') {
         this.walkthroughDone = true;
@@ -2455,8 +2464,12 @@ export class ReviewSession {
         const mappedTarget = this.findMappedCodeForNode(lastFocus.id, directives);
         const parsed = mappedTarget ? parseCodeMapTarget(mappedTarget) : null;
         if (parsed) {
+          const preferredLines =
+            !parsed.lines || parsed.lines.start <= 5
+              ? resolveBestDefaultLinesForFile(parsed.file, this.contextPack)
+              : undefined;
           const clampedLines = clampHighlightRange(
-            parsed.lines ?? { start: 1, end: 10 }
+            parsed.lines ?? preferredLines ?? { start: 1, end: 8 }
           );
           const cmd: CodeGotoDirective = {
             type: 'code_goto',
@@ -2471,12 +2484,17 @@ export class ReviewSession {
           );
           try {
             this.manualEditorLocation = undefined;
-            await this.deps.codeNavigator.navigateTo(
+            const navigated = await this.deps.codeNavigator.navigateTo(
               { ...cmd, view },
               this.target,
-              { preferWorkspaceFile: !isModifiedFile }
+              preferredLines
+                ? { preferWorkspaceFile: !isModifiedFile, preferredLines }
+                : { preferWorkspaceFile: !isModifiedFile }
             );
-            this.syncCallChainActiveForLocation(parsed.file, clampedLines.start);
+            this.syncCallChainActiveForLocation(
+              parsed.file,
+              navigated?.lines?.start ?? clampedLines.start
+            );
             this.emitSessionState(this.phase);
           } catch (err) {
             this.deps.logger?.log('code.focus_auto_nav_failed', {
@@ -2620,10 +2638,14 @@ export class ReviewSession {
       const parsed = parseCodeMapTarget(mappedTarget);
       if (parsed) {
         this.manualEditorLocation = undefined;
+        const preferredLines =
+          !parsed.lines || parsed.lines.start <= 5
+            ? resolveBestDefaultLinesForFile(parsed.file, this.contextPack)
+            : undefined;
         const cmd: CodeGotoDirective = {
           type: 'code_goto',
           file: parsed.file,
-          lines: parsed.lines ? clampHighlightRange(parsed.lines) : undefined,
+          lines: parsed.lines ? clampHighlightRange(parsed.lines) : preferredLines,
           label: `白板节点 ${nodeId}`,
         };
         const { view, isModifiedFile } = resolveCodeGotoView(
@@ -2634,7 +2656,9 @@ export class ReviewSession {
         await this.deps.codeNavigator.navigateTo(
           { ...cmd, view },
           this.target,
-          { preferWorkspaceFile: !isModifiedFile }
+          preferredLines
+            ? { preferWorkspaceFile: !isModifiedFile, preferredLines }
+            : { preferWorkspaceFile: !isModifiedFile }
         );
         this.emitSessionState(this.phase);
         return;
@@ -2648,14 +2672,16 @@ export class ReviewSession {
     );
     if (matched) {
       this.manualEditorLocation = undefined;
+      const preferredLines = resolveBestDefaultLinesForFile(matched.path, this.contextPack);
       await this.deps.codeNavigator.navigateTo(
         {
           type: 'code_goto',
           file: matched.path,
-          lines: { start: 1, end: 10 },
+          lines: preferredLines ?? { start: 1, end: 8 },
           label: `白板节点 ${nodeId}`,
         },
-        this.target
+        this.target,
+        preferredLines ? { preferredLines } : undefined
       );
       this.emitSessionState(this.phase);
     }
@@ -3899,6 +3925,64 @@ export function parseHunkHeadRanges(hunkHeaders: string[]): LineRange[] {
     ranges.push({ start, end });
   }
   return ranges;
+}
+
+export function resolveBestDefaultLinesForFile(
+  relFile: string,
+  contextPack: ReviewContextPack | undefined
+): LineRange | undefined {
+  if (!contextPack) {
+    return undefined;
+  }
+  const normalizeRel = (p: string) =>
+    p.replace(/\\/g, '/').replace(/^\/+/, '').replace(/^\.\//, '');
+  const cleanRel = normalizeRel(relFile);
+  const cleanLower = cleanRel.toLowerCase();
+  const changedFile =
+    contextPack.files.find((f) => normalizeRel(f.path) === cleanRel) ??
+    contextPack.files.find((f) => normalizeRel(f.path).toLowerCase() === cleanLower);
+  if (!changedFile) {
+    return undefined;
+  }
+
+  const hunkRanges = parseHunkHeadRanges(changedFile.hunkHeaders);
+  const nonImportHunk = hunkRanges.find((h) => h.start > 15);
+  if (nonImportHunk) {
+    return {
+      start: nonImportHunk.start,
+      end: Math.min(nonImportHunk.end, nonImportHunk.start + 7),
+    };
+  }
+
+  const symLines: number[] = [];
+  if (changedFile.touchedSymbols) {
+    for (const sym of changedFile.touchedSymbols) {
+      const m = sym.match(/\(L(\d+)\)/);
+      if (m) {
+        const line = Number.parseInt(m[1], 10);
+        if (Number.isFinite(line) && line > 0) {
+          symLines.push(line);
+        }
+      }
+    }
+  }
+  const deepSym = symLines.find((l) => l > 15);
+  if (deepSym !== undefined) {
+    return { start: deepSym, end: deepSym + 7 };
+  }
+  const anyRealSym = symLines.find((l) => l > 1);
+  if (anyRealSym !== undefined) {
+    return { start: anyRealSym, end: anyRealSym + 7 };
+  }
+
+  const firstHunk = hunkRanges[0];
+  if (firstHunk) {
+    return {
+      start: firstHunk.start,
+      end: Math.min(firstHunk.end, firstHunk.start + 7),
+    };
+  }
+  return undefined;
 }
 
 export function resolveCodeGotoView(

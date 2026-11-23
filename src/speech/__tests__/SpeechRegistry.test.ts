@@ -23,14 +23,22 @@ const FAKE_SECRETS = {
 } as unknown as vscode.SecretStorage;
 
 describe('SpeechRegistry circuit breaker & fallback telemetry', () => {
-  it('opens circuit after 2 consecutive primary TTS failures and routes directly to fallback', async () => {
+  it('opens circuit after 3 consecutive failures and auto-recovers via half-open probe after cooldown', async () => {
+    let shouldFail = true;
+    let clockMs = 1_000;
     let primaryCalls = 0;
     const primary: ITtsProvider = {
       id: 'edge-neural',
       displayName: 'Mock Edge TTS',
-      synthesize: vi.fn(async () => {
+      synthesize: vi.fn(async (text: string) => {
         primaryCalls += 1;
-        throw new Error('socket timeout');
+        if (shouldFail) {
+          throw new Error('socket timeout');
+        }
+        return {
+          audioBase64: Buffer.from(`edge:${text}`).toString('base64'),
+          mimeType: 'audio/mpeg',
+        };
       }),
     };
 
@@ -46,6 +54,9 @@ describe('SpeechRegistry circuit breaker & fallback telemetry', () => {
     const registry = new SpeechRegistry('/tmp', FAKE_SECRETS, BASE_SPEECH_CFG, {
       ttsProvider: primary,
       fallbackTts: fallback,
+      circuitFailureThreshold: 3,
+      circuitCooldownMs: 30_000,
+      now: () => clockMs,
     });
 
     const warnings: string[] = [];
@@ -63,16 +74,44 @@ describe('SpeechRegistry circuit breaker & fallback telemetry', () => {
     );
     expect(r2.fallbackUsed).toBe(true);
     expect(r2.fallbackReason).toBe('socket timeout');
-    expect(warnings.length).toBe(1); // warning emitted only once
+    expect(warnings.length).toBe(1);
     expect(primaryCalls).toBe(2);
 
-    // Third call hits open circuit -> skips primary completely!
     const r3 = await registry.synthesizeWithFallback('第三句', { voice: 'v', rate: 1 }, (w) =>
       warnings.push(w)
     );
     expect(r3.fallbackUsed).toBe(true);
-    expect(r3.fallbackReason).toBe('circuit_open');
-    expect(primaryCalls).toBe(2);
+    expect(r3.fallbackReason).toBe('socket timeout');
+    expect(primaryCalls).toBe(3);
+
+    // 4th call during cooldown hits open circuit -> skips primary completely
+    clockMs += 10_000;
+    const r4 = await registry.synthesizeWithFallback('第四句', { voice: 'v', rate: 1 }, (w) =>
+      warnings.push(w)
+    );
+    expect(r4.fallbackUsed).toBe(true);
+    expect(r4.fallbackReason).toBe('circuit_open');
+    expect(primaryCalls).toBe(3);
+
+    // After 30s cooldown, half-open probe fails -> extends cooldown without incrementing threshold
+    clockMs += 20_001;
+    const r5 = await registry.synthesizeWithFallback('第五句', { voice: 'v', rate: 1 });
+    expect(r5.fallbackUsed).toBe(true);
+    expect(r5.fallbackReason).toBe('socket timeout');
+    expect(primaryCalls).toBe(4);
+
+    clockMs += 5_000;
+    const r6 = await registry.synthesizeWithFallback('第六句', { voice: 'v', rate: 1 });
+    expect(r6.fallbackReason).toBe('circuit_open');
+    expect(primaryCalls).toBe(4);
+
+    // After next cooldown elapses and primary recovers, auto-switches back to Edge TTS
+    shouldFail = false;
+    clockMs += 30_000;
+    const r7 = await registry.synthesizeWithFallback('第七句', { voice: 'v', rate: 1 });
+    expect(r7.fallbackUsed).toBeUndefined();
+    expect(Buffer.from(r7.audioBase64, 'base64').toString('utf8')).toBe('edge:第七句');
+    expect(primaryCalls).toBe(5);
   });
 
   it('resets failure count when primary recovers before threshold', async () => {

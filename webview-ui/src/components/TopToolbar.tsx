@@ -1,13 +1,21 @@
-import React from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
+  ChevronDown,
   Columns2,
   ExternalLink,
   FileCode2,
   GitBranch,
   GitFork,
   MessageSquarePlus,
+  Play,
+  RotateCcw,
+  Square,
 } from 'lucide-react';
-import type { SessionMetaState, SessionPhase } from '../../../src/shared/protocol';
+import type {
+  ReplayStatusState,
+  SessionMetaState,
+  SessionPhase,
+} from '../../../src/shared/protocol';
 
 interface TopToolbarProps {
   phase: SessionPhase;
@@ -17,6 +25,12 @@ interface TopToolbarProps {
   notesOpen?: boolean;
   callChainCount?: number;
   callChainOpen?: boolean;
+  replayStatus?: ReplayStatusState;
+  onStartReplay?: (
+    mode: 'from-start' | 'current-section' | 'from-index',
+    startIndex?: number
+  ) => void;
+  onStopReplay?: () => void;
   onToggleViewMode: () => void;
   onToggleCallChain?: () => void;
   onPopOutWindow: () => void;
@@ -43,15 +57,50 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
   notesOpen,
   callChainCount = 0,
   callChainOpen = false,
+  replayStatus,
+  onStartReplay,
+  onStopReplay,
   onToggleViewMode,
   onToggleCallChain,
   onPopOutWindow,
   onSwitchTarget,
   onPublishOrExportNotes,
 }) => {
+  const [replayMenuOpen, setReplayMenuOpen] = useState(false);
+  const replayWrapRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!replayMenuOpen) {
+      return;
+    }
+    const onMouseDown = (e: MouseEvent) => {
+      if (replayWrapRef.current && !replayWrapRef.current.contains(e.target as Node)) {
+        setReplayMenuOpen(false);
+      }
+    };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setReplayMenuOpen(false);
+      }
+    };
+    window.addEventListener('mousedown', onMouseDown);
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.removeEventListener('mousedown', onMouseDown);
+      window.removeEventListener('keydown', onKeyDown);
+    };
+  }, [replayMenuOpen]);
+
   const isBranchExplore = meta.sourceKind === 'branch-explore';
+  const isCorePathReview = meta.reviewMode === 'core-path-line-review';
   const phaseLabel =
-    phase === 'analyzing' && isBranchExplore ? '扫描项目' : PHASE_LABELS[phase];
+    phase === 'analyzing' && isCorePathReview
+      ? '定位链路'
+      : phase === 'analyzing' && isBranchExplore
+        ? '扫描项目'
+        : PHASE_LABELS[phase];
+
+  const hasReplay = Boolean(replayStatus && replayStatus.totalSegments > 0 && onStartReplay);
 
   return (
     <header className="ra-toolbar">
@@ -62,6 +111,14 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
             {statusMessage || meta.targetSubtitle} · {meta.acpProfileLabel}
           </div>
         </div>
+        {isCorePathReview && (
+          <span
+            className="ra-mode-badge"
+            title="基于输入的核心链路逐行 Review 模式：逐段看核心分支与调用，自动跳子方法并按需深化白板"
+          >
+            逐行链路 Review
+          </span>
+        )}
         <span className="ra-phase-pill">
           <span className={`ra-phase-dot ${phase}`} />
           {phaseLabel}
@@ -69,6 +126,94 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
       </div>
 
       <div className="ra-toolbar-actions">
+        {hasReplay && replayStatus && (
+          <div ref={replayWrapRef} className="ra-replay-wrap">
+            <button
+              type="button"
+              className={`ra-btn ${replayStatus.isReplaying || replayMenuOpen ? 'active' : ''}`}
+              onClick={() => setReplayMenuOpen((prev) => !prev)}
+              title="重放本轮历史讲解（音画 + 白板 + 代码跳转全同步，不消耗额外模型调用）"
+            >
+              <RotateCcw size={14} />
+              <span>
+                {replayStatus.isReplaying && replayStatus.currentIndex !== undefined
+                  ? `重放中 ${replayStatus.currentIndex + 1}/${replayStatus.totalSegments}`
+                  : '重放'}
+              </span>
+              <ChevronDown size={11} />
+            </button>
+
+            {replayMenuOpen && (
+              <div className="ra-replay-popover" role="menu" aria-label="同步重放选项">
+                <div className="ra-tree-popover-header">
+                  <span>同步重放（音频 · 白板 · 代码）</span>
+                  <span className="ra-tree-popover-sub">
+                    共 {replayStatus.totalSegments} 段
+                  </span>
+                </div>
+                <div className="ra-tree-popover-list">
+                  <button
+                    type="button"
+                    className="ra-tree-node-btn"
+                    onClick={() => {
+                      setReplayMenuOpen(false);
+                      onStartReplay?.('from-start');
+                    }}
+                  >
+                    <Play size={12} />
+                    <span>从头播放全部（第 1 段起）</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="ra-tree-node-btn"
+                    onClick={() => {
+                      setReplayMenuOpen(false);
+                      onStartReplay?.('current-section');
+                    }}
+                  >
+                    <RotateCcw size={12} />
+                    <span>重放当前章节</span>
+                  </button>
+                  {replayStatus.isReplaying && onStopReplay && (
+                    <button
+                      type="button"
+                      className="ra-tree-node-btn danger"
+                      onClick={() => {
+                        setReplayMenuOpen(false);
+                        onStopReplay();
+                      }}
+                    >
+                      <Square size={12} />
+                      <span>停止重放</span>
+                    </button>
+                  )}
+                  {replayStatus.checkpoints.length > 0 && (
+                    <>
+                      <div className="ra-replay-divider">按章节 / 检查点重放</div>
+                      {replayStatus.checkpoints.map((cp) => (
+                        <button
+                          key={`${cp.startIndex}-${cp.title}`}
+                          type="button"
+                          className="ra-tree-node-btn"
+                          onClick={() => {
+                            setReplayMenuOpen(false);
+                            onStartReplay?.('from-index', cp.startIndex);
+                          }}
+                          title={`从第 ${cp.startIndex + 1} 段起重放`}
+                        >
+                          <span className="ra-level-tag">#{cp.startIndex + 1}</span>
+                          <span className="ra-tree-node-title">{cp.title}</span>
+                          <span className="ra-tree-popover-sub">{cp.segmentCount} 段</span>
+                        </button>
+                      ))}
+                    </>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
         {!isBranchExplore && (
           <button
             type="button"

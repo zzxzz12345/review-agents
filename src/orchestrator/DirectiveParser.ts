@@ -7,10 +7,12 @@ import type {
   LineRange,
   ReviewNoteDirective,
   UtteranceSegment,
+  WalkthroughDoneDirective,
   WbClearDirective,
   WbFocusDirective,
   WbPopDirective,
   WbRenderDirective,
+  WbRenderMode,
 } from '../shared/protocol';
 import { parseCallChainBody } from './callChainUtils';
 
@@ -24,6 +26,7 @@ const KNOWN_TAGS = [
   'review_note',
   'action_item',
   'call_chain',
+  'walkthrough_done',
 ] as const;
 
 const BLOCK_TAGS = new Set<string>([
@@ -262,12 +265,22 @@ export class DirectiveParser {
             // ignore invalid JSON map attribute
           }
         }
-        const mode = attrs.mode === 'push' ? 'push' : 'replace';
+        const rawMode = (attrs.mode ?? '').trim().toLowerCase();
+        const mode: WbRenderMode =
+          rawMode === 'update' || rawMode === 'rewrite'
+            ? 'update'
+            : rawMode === 'push'
+              ? 'push'
+              : 'replace';
+        const targetId = (attrs.target ?? attrs.targetId ?? '').trim() || undefined;
+        const parentId = (attrs.parent ?? attrs.parentId ?? '').trim() || undefined;
         const d: WbRenderDirective = {
           type: 'wb_render',
           id: (attrs.id ?? '').trim() || `diagram-${Date.now()}`,
           title: (attrs.title ?? '').trim() || 'Architecture Overview',
           mode,
+          targetId,
+          parentId,
           mermaidCode,
           nodeCodeMap,
         };
@@ -291,6 +304,10 @@ export class DirectiveParser {
       }
       case 'wb_clear': {
         const d: WbClearDirective = { type: 'wb_clear' };
+        return d;
+      }
+      case 'walkthrough_done': {
+        const d: WalkthroughDoneDirective = { type: 'walkthrough_done' };
         return d;
       }
       case 'code_goto': {
@@ -587,9 +604,23 @@ export function sanitizeMermaidCode(raw: string): string {
     return code;
   }
 
+  // Convert sequenceDiagram-style `Note right/left/over NodeId: text` inside flowcharts into valid dashed note nodes
+  let noteSeq = 0;
+  const noteRegex =
+    /^(\s*)Note\s+(?:right\s+of|left\s+of|over)\s+([A-Za-z_][A-Za-z0-9_-]*)(?:\s*,\s*[A-Za-z_][A-Za-z0-9_-]*)?\s*:\s*(.+)$/i;
+
   // Auto-quote unquoted rectangular node labels containing parentheses, colons, or slashes
   // Example: Auth[Token Refresh (v2)] -> Auth["Token Refresh (v2)"]
-  const fixedLines = code.split('\n').map((line) => {
+  const fixedLines = code.split('\n').map((rawLine) => {
+    const noteMatch = rawLine.match(noteRegex);
+    let line = rawLine;
+    if (noteMatch) {
+      noteSeq += 1;
+      const [, indent, targetNodeId, noteBody] = noteMatch;
+      const cleanBody = noteBody.trim().replace(/"/g, "'");
+      line = `${indent}_Note_${noteSeq}["📝 ${cleanBody}"] -.-> ${targetNodeId}`;
+    }
+
     const trimmed = line.trim();
     if (
       trimmed.startsWith('%%') ||

@@ -38,6 +38,11 @@
         "icon": "$(compass)"
       },
       {
+        "command": "reviewAgents.corePathLineReview",
+        "title": "Review Agents: Core-Path Line-by-Line Review (基于输入的核心链路逐行 Review)",
+        "icon": "$(list-tree)"
+      },
+      {
         "command": "reviewAgents.openWhiteboard",
         "title": "Review Agents: Open/Focus Whiteboard"
       },
@@ -68,6 +73,11 @@
       {
         "command": "reviewAgents.stopSession",
         "title": "Review Agents: End Review Session"
+      },
+      {
+        "command": "reviewAgents.replayFromStart",
+        "title": "Review Agents: Replay Walkthrough From Beginning (从头重放)",
+        "icon": "$(debug-restart)"
       },
       {
         "command": "reviewAgents.openLogs",
@@ -254,6 +264,11 @@
           "type": "boolean",
           "default": true,
           "description": "Automatically install missing local CLI dependencies (sox, whisper-cpp) and the local Whisper speech model (ggml-small-q5_1.bin)."
+        },
+        "reviewAgents.walkthrough.autoContinue": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically prefetch and advance to subsequent chapters/sections unless paused or interrupted."
         }
       }
     }

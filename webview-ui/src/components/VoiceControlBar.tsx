@@ -1,20 +1,25 @@
 import React, { useState } from 'react';
 import {
   BookmarkPlus,
+  FastForward,
   Hand,
   Mic,
   MicOff,
   Pause,
   Play,
   Send,
+  StepForward,
   Volume2,
   VolumeX,
   X,
 } from 'lucide-react';
-import type { VoiceMode } from '../../../src/shared/protocol';
+import type { ReviewModeStyle, VoiceMode } from '../../../src/shared/protocol';
 
 interface VoiceControlBarProps {
   voiceMode: VoiceMode;
+  reviewMode?: ReviewModeStyle;
+  canStepNext?: boolean;
+  autoContinue?: boolean;
   micActive: boolean;
   isUserSpeaking: boolean;
   isAssistantSpeaking: boolean;
@@ -29,7 +34,9 @@ interface VoiceControlBarProps {
   onEndPtt: () => void;
   onToggleVoiceMode: (mode: VoiceMode) => void;
   onToggleMute: (muted: boolean) => void;
+  onToggleAutoContinue?: (enabled: boolean) => void;
   onManualInterrupt: () => void;
+  onStepNext?: () => void;
   onSubmitText: (text: string) => void;
   onClearSelectedNode: () => void;
   onQuickNote: (noteText: string) => void;
@@ -37,6 +44,9 @@ interface VoiceControlBarProps {
 
 export const VoiceControlBar: React.FC<VoiceControlBarProps> = ({
   voiceMode,
+  reviewMode,
+  canStepNext,
+  autoContinue = true,
   micActive,
   isUserSpeaking,
   isAssistantSpeaking,
@@ -51,7 +61,9 @@ export const VoiceControlBar: React.FC<VoiceControlBarProps> = ({
   onEndPtt,
   onToggleVoiceMode,
   onToggleMute,
+  onToggleAutoContinue,
   onManualInterrupt,
+  onStepNext,
   onSubmitText,
   onClearSelectedNode,
   onQuickNote,
@@ -120,6 +132,22 @@ export const VoiceControlBar: React.FC<VoiceControlBarProps> = ({
         {ttsMuted ? <VolumeX size={14} /> : <Volume2 size={14} />}
       </button>
 
+      {onToggleAutoContinue && (
+        <button
+          type="button"
+          className={`ra-btn ${autoContinue ? 'active' : ''}`}
+          onClick={() => onToggleAutoContinue(!autoContinue)}
+          title={
+            autoContinue
+              ? '自动连续推进已开启：不暂停时不询问，后台预缓冲自动接下一章节'
+              : '自动连续推进已关闭：每轮讲完后停下等待指令'
+          }
+        >
+          <FastForward size={13} />
+          <span>{autoContinue ? '自动续讲: 开' : '自动续讲: 关'}</span>
+        </button>
+      )}
+
       {(canPause || isPaused) && (
         <button
           type="button"
@@ -148,6 +176,18 @@ export const VoiceControlBar: React.FC<VoiceControlBarProps> = ({
         </button>
       )}
 
+      {canStepNext && onStepNext && (
+        <button
+          type="button"
+          className="ra-btn active"
+          onClick={onStepNext}
+          title="继续沿当前核心链路逐行 Review 下一段分支 / 子方法"
+        >
+          <StepForward size={14} />
+          <span>继续逐行往下</span>
+        </button>
+      )}
+
       {selectedNodeId && (
         <span className="ra-node-pill">
           已选节点: {selectedNodeId}
@@ -172,7 +212,9 @@ export const VoiceControlBar: React.FC<VoiceControlBarProps> = ({
           placeholder={
             selectedNodeId
               ? `针对节点 ${selectedNodeId} 追问，或直接开口说话...`
-              : '直接开口或输入指令（如：讲下项目架构 / Review 某模块 / 记批注）...'
+              : reviewMode === 'core-path-line-review'
+                ? '输入“继续”往下逐行审，或针对当前分支/子方法提问、记批注...'
+                : '直接开口或输入指令（如：讲下项目架构 / Review 某模块 / 记批注）...'
           }
         />
         <button type="submit" className="ra-btn" title="发送提问">

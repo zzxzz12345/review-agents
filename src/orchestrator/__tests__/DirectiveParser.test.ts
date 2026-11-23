@@ -223,4 +223,57 @@ erDiagram
       ],
     });
   });
+
+  it('parses wb_render mode="update|rewrite", target, and parent attributes', () => {
+    const parser = new DirectiveParser(6);
+    const out = [
+      ...parser.feed(
+        '<wb_render mode="update" target="l2-auth" title="更新 L2">flowchart LR\n  A --> B\n</wb_render>' +
+          '<wb_render mode="push" parent="overview" id="l2-db" title="DB 分支">erDiagram\n  USER ||--o{ KEY : has\n</wb_render>' +
+          '白板已更新并新增分支。'
+      ),
+      ...parser.flush(),
+    ];
+
+    expect(out.length).toBe(1);
+    expect(out[0].directivesBefore[0]).toMatchObject({
+      type: 'wb_render',
+      mode: 'update',
+      targetId: 'l2-auth',
+      title: '更新 L2',
+    });
+    expect(out[0].directivesBefore[1]).toMatchObject({
+      type: 'wb_render',
+      mode: 'push',
+      parentId: 'overview',
+      id: 'l2-db',
+      title: 'DB 分支',
+    });
+  });
+
+  it('parses self-closing <walkthrough_done/> directive', () => {
+    const parser = new DirectiveParser(7);
+    const out = [
+      ...parser.feed('这一整条链路已全部讲解完毕。<walkthrough_done/>'),
+      ...parser.flush(),
+    ];
+    const allDirs = out.flatMap((s) => [...s.directivesBefore, ...s.directivesAfter]);
+    expect(allDirs).toContainEqual({ type: 'walkthrough_done' });
+  });
+
+  it('rewrites sequence-style Note right/left/over lines inside flowchart without breaking sequenceDiagram', () => {
+    const brokenFlow = `flowchart TD
+  N1["下单请求"] --> N2["下单 & 接收回执"]
+  Note right of N2: 每 lane 独立串行
+  Note left of N1: 入口校验`;
+    const fixedFlow = sanitizeMermaidCode(brokenFlow);
+    expect(fixedFlow).toContain('_Note_1["📝 每 lane 独立串行"] -.-> N2');
+    expect(fixedFlow).toContain('_Note_2["📝 入口校验"] -.-> N1');
+    expect(fixedFlow).not.toContain('Note right of');
+
+    const seqDiagram = `sequenceDiagram
+  Note right of N2: 每 lane 独立串行
+  A->>N2: submit()`;
+    expect(sanitizeMermaidCode(seqDiagram)).toBe(seqDiagram);
+  });
 });

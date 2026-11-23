@@ -4,14 +4,23 @@ import type {
   CallChainNode,
   CallChainState,
   ChapterProgress,
-  DiagramStackItem,
   Directive,
+  ReplayStatusState,
   ReviewNoteDraft,
   SessionMetaState,
   SessionPhase,
   UtteranceSegment,
   VoiceMode,
 } from '../../src/shared/protocol';
+import {
+  applyWhiteboardDirective,
+  createEmptyWhiteboardTree,
+  deriveActivePath,
+  selectWhiteboardIndex,
+  selectWhiteboardLayer,
+  syncWhiteboardTreeFromPayload,
+  type WhiteboardTreeState,
+} from '../../src/shared/whiteboardTree';
 import { AgentActivityBar } from './components/AgentActivityBar';
 import { BreadcrumbStack } from './components/BreadcrumbStack';
 import { CallChainSidebar, type CallersEntryState } from './components/CallChainSidebar';
@@ -41,6 +50,7 @@ const DEFAULT_META: SessionMetaState = {
   vadSilenceMs: 900,
   isPoppedOut: false,
   ttsMuted: false,
+  autoContinue: true,
 };
 
 const DEFAULT_ACTIVITY: AgentActivityState = {
@@ -65,12 +75,11 @@ export const App: React.FC = () => {
   const [statusMessage, setStatusMessage] = useState<string | undefined>();
   const [meta, setMeta] = useState<SessionMetaState>(DEFAULT_META);
   const [activity, setActivity] = useState<AgentActivityState>(DEFAULT_ACTIVITY);
-  const [diagramNav, setDiagramNav] = useState<{
-    items: DiagramStackItem[];
-    activeIndex: number;
-  }>({ items: [], activeIndex: -1 });
-  const diagramNavRef = useRef(diagramNav);
-  diagramNavRef.current = diagramNav;
+  const [diagramTree, setDiagramTree] = useState<WhiteboardTreeState>(() =>
+    createEmptyWhiteboardTree()
+  );
+  const diagramTreeRef = useRef(diagramTree);
+  diagramTreeRef.current = diagramTree;
 
   const [chapter, setChapter] = useState<ChapterProgress | undefined>();
   const [subtitleText, setSubtitleText] = useState('');
@@ -81,6 +90,11 @@ export const App: React.FC = () => {
   const [callersMap, setCallersMap] = useState<Record<string, CallersEntryState | undefined>>({});
   const [callChainOpen, setCallChainOpen] = useState(false);
   const [callChainWidth, setCallChainWidth] = useState(270);
+  const [replayStatus, setReplayStatus] = useState<ReplayStatusState>({
+    totalSegments: 0,
+    isReplaying: false,
+    checkpoints: [],
+  });
   const userSidebarOverrideRef = useRef(false);
   const workspaceBodyRef = useRef<HTMLDivElement | null>(null);
   const [toasts, setToasts] = useState<ToastItem[]>([]);
@@ -109,68 +123,13 @@ export const App: React.FC = () => {
           total: dir.total,
           title: dir.title,
         });
-      } else if (dir.type === 'wb_render') {
-        const nextItem: DiagramStackItem = {
-          id: dir.id,
-          title: dir.title,
-          mermaidCode: dir.mermaidCode,
-          nodeCodeMap: dir.nodeCodeMap,
-        };
-        setDiagramNav((prev) => {
-          if (dir.mode === 'push' && prev.items.length > 0) {
-            const anchor =
-              prev.activeIndex >= 0
-                ? Math.min(prev.activeIndex, prev.items.length - 1)
-                : prev.items.length - 1;
-            const items = [...prev.items.slice(0, anchor + 1), nextItem];
-            return { items, activeIndex: items.length - 1 };
-          }
-          return { items: [nextItem], activeIndex: 0 };
-        });
-      } else if (dir.type === 'wb_focus') {
-        setDiagramNav((prev) => {
-          if (prev.items.length === 0) {
-            return prev;
-          }
-          const idx =
-            prev.activeIndex >= 0
-              ? Math.min(prev.activeIndex, prev.items.length - 1)
-              : prev.items.length - 1;
-          const items = [...prev.items];
-          items[idx] = { ...items[idx], focusedNodeId: dir.id, focusedEdge: dir.edge };
-          return { ...prev, items };
-        });
-      } else if (dir.type === 'wb_pop') {
-        setDiagramNav((prev) => {
-          if (prev.items.length <= 1) {
-            return prev;
-          }
-          const idx =
-            prev.activeIndex >= 0
-              ? Math.min(prev.activeIndex, prev.items.length - 1)
-              : prev.items.length - 1;
-          if (idx <= 0) {
-            return prev;
-          }
-          return { ...prev, activeIndex: idx - 1 };
-        });
-      } else if (dir.type === 'wb_clear') {
-        setDiagramNav((prev) => {
-          if (prev.items.length === 0) {
-            return prev;
-          }
-          const idx =
-            prev.activeIndex >= 0
-              ? Math.min(prev.activeIndex, prev.items.length - 1)
-              : prev.items.length - 1;
-          const items = [...prev.items];
-          items[idx] = {
-            ...items[idx],
-            focusedNodeId: undefined,
-            focusedEdge: undefined,
-          };
-          return { ...prev, items };
-        });
+      } else if (
+        dir.type === 'wb_render' ||
+        dir.type === 'wb_focus' ||
+        dir.type === 'wb_pop' ||
+        dir.type === 'wb_clear'
+      ) {
+        setDiagramTree((prev) => applyWhiteboardDirective(prev, dir));
       }
     }
   }, []);
@@ -219,7 +178,7 @@ export const App: React.FC = () => {
 
   const handleBargeIn = useCallback(() => {
     const cutoff = audioQueue.interruptAndFlush();
-    const { items, activeIndex } = diagramNavRef.current;
+    const { stack: items, activeIndex } = deriveActivePath(diagramTreeRef.current);
     const idx = activeIndex >= 0 ? Math.min(activeIndex, items.length - 1) : items.length - 1;
     const active = idx >= 0 ? items[idx] : undefined;
     const visiblePath = idx >= 0 ? items.slice(0, idx + 1) : items;
@@ -340,11 +299,7 @@ export const App: React.FC = () => {
           applyLocalDirectivesRef.current([msg.directive]);
           return;
         case 'whiteboard:syncStack':
-          setDiagramNav({
-            items: msg.stack,
-            activeIndex:
-              msg.activeIndex !== undefined ? msg.activeIndex : msg.stack.length - 1,
-          });
+          setDiagramTree(syncWhiteboardTreeFromPayload(msg));
           return;
         case 'chapter:update':
           setChapter(msg.chapter);
@@ -389,6 +344,9 @@ export const App: React.FC = () => {
               expanded: true,
             },
           }));
+          return;
+        case 'replay:status':
+          setReplayStatus(msg.status);
           return;
       }
     });
@@ -465,11 +423,11 @@ export const App: React.FC = () => {
     [callersMap]
   );
 
-  const activeIdx =
-    diagramNav.activeIndex >= 0
-      ? Math.min(diagramNav.activeIndex, diagramNav.items.length - 1)
-      : diagramNav.items.length - 1;
-  const currentDiagram = activeIdx >= 0 ? diagramNav.items[activeIdx] : undefined;
+  const { stack: activeStack, activeIndex: activeIdx } = deriveActivePath(diagramTree);
+  const currentDiagram =
+    activeIdx >= 0 && activeIdx < activeStack.length
+      ? activeStack[activeIdx]
+      : undefined;
 
   return (
     <div className="ra-app">
@@ -481,6 +439,11 @@ export const App: React.FC = () => {
         notesOpen={notesOpen}
         callChainCount={callChain?.nodes.length ?? 0}
         callChainOpen={callChainOpen}
+        replayStatus={replayStatus}
+        onStartReplay={(mode, startIndex) =>
+          postToHost({ type: 'replay:start', mode, startIndex })
+        }
+        onStopReplay={() => postToHost({ type: 'replay:stop' })}
         onToggleViewMode={() => postToHost({ type: 'ui:toggleViewMode' })}
         onToggleCallChain={() => {
           userSidebarOverrideRef.current = true;
@@ -492,15 +455,23 @@ export const App: React.FC = () => {
       />
 
       <BreadcrumbStack
-        stack={diagramNav.items}
+        stack={activeStack}
         activeIndex={activeIdx}
+        nodes={diagramTree.nodes}
+        activeId={diagramTree.activeId}
         activeEditorFile={meta.activeEditorFile}
         activeEditorLabel={meta.activeEditorLabel}
         onPopTo={(index) => {
-          setDiagramNav((prev) => ({ ...prev, activeIndex: index }));
+          setDiagramTree((prev) => selectWhiteboardIndex(prev, index));
           setSelectedNodeId(undefined);
           postToHost({ type: 'node:select', nodeId: undefined });
           postToHost({ type: 'whiteboard:popTo', index });
+        }}
+        onSelectLayer={(id) => {
+          setDiagramTree((prev) => selectWhiteboardLayer(prev, id));
+          setSelectedNodeId(undefined);
+          postToHost({ type: 'node:select', nodeId: undefined });
+          postToHost({ type: 'whiteboard:selectLayer', id });
         }}
       />
 
@@ -534,6 +505,7 @@ export const App: React.FC = () => {
           onDoubleClickNode={(nodeId, codeTarget) => {
             postToHost({ type: 'node:doubleClick', nodeId, codeTarget });
           }}
+          onStartCorePathReview={() => postToHost({ type: 'ui:startCorePathReview' })}
           onStartBranchExplore={() => postToHost({ type: 'ui:startBranchExplore' })}
           onSwitchTarget={() => postToHost({ type: 'ui:switchTarget' })}
           onParseError={(info) => {
@@ -609,6 +581,13 @@ export const App: React.FC = () => {
         />
         <VoiceControlBar
           voiceMode={meta.voiceMode}
+          reviewMode={meta.reviewMode}
+          autoContinue={meta.autoContinue ?? true}
+          canStepNext={
+            meta.reviewMode === 'core-path-line-review' &&
+            phase === 'idle' &&
+            Boolean(currentDiagram)
+          }
           micActive={voiceVad.micActive}
           isUserSpeaking={voiceVad.isUserSpeaking}
           isAssistantSpeaking={
@@ -631,7 +610,18 @@ export const App: React.FC = () => {
             setMeta((prev) => ({ ...prev, ttsMuted: muted }));
             postToHost({ type: 'ui:toggleMute', muted });
           }}
+          onToggleAutoContinue={(enabled: boolean) => {
+            setMeta((prev) => ({ ...prev, autoContinue: enabled }));
+            postToHost({ type: 'ui:toggleAutoContinue', enabled });
+          }}
           onManualInterrupt={handleBargeIn}
+          onStepNext={() => {
+            postToHost({
+              type: 'text:userPrompt',
+              text: '继续沿当前核心链路，从刚才停下的下一行或下一个核心分支继续逐行 Review，遇到关键子方法自动跳入说明并按需深化白板层级。',
+              selectedNodeId,
+            });
+          }}
           onSubmitText={(text) => {
             if (audioQueue.isSpeaking) {
               handleBargeIn();

@@ -66,11 +66,15 @@ export interface AgentActivityState {
   recentLogs: AgentActivityLogEntry[];
 }
 
+export type WbRenderMode = 'replace' | 'push' | 'update';
+
 export interface WbRenderDirective {
   type: 'wb_render';
   id: string;
   title: string;
-  mode: 'replace' | 'push';
+  mode: WbRenderMode;
+  targetId?: string;
+  parentId?: string;
   mermaidCode: string;
   nodeCodeMap?: Record<string, string>;
 }
@@ -145,6 +149,10 @@ export interface CallChainDirective {
   activeIndex: number;
 }
 
+export interface WalkthroughDoneDirective {
+  type: 'walkthrough_done';
+}
+
 export type Directive =
   | WbRenderDirective
   | WbFocusDirective
@@ -153,7 +161,8 @@ export type Directive =
   | CodeGotoDirective
   | ChapterDirective
   | ReviewNoteDirective
-  | CallChainDirective;
+  | CallChainDirective
+  | WalkthroughDoneDirective;
 
 export interface UtteranceSegment {
   segmentId: string;
@@ -179,6 +188,9 @@ export interface DiagramStackItem {
   nodeCodeMap?: Record<string, string>;
   focusedNodeId?: string;
   focusedEdge?: string;
+  parentId?: string;
+  level?: number;
+  revision?: number;
 }
 
 export interface ChapterProgress {
@@ -211,6 +223,7 @@ export interface InterruptionSnapshot {
   diagramId?: string;
   focusedNodeId?: string;
   stackPath: string;
+  treeOutline?: string;
   editorState?: EditorLocationState;
 }
 
@@ -220,10 +233,16 @@ export interface WebviewPlaybackCutoff {
   spokenCharOffset: number;
 }
 
+export type ReviewModeStyle =
+  | 'walkthrough'
+  | 'branch-explore'
+  | 'core-path-line-review';
+
 export interface SessionMetaState {
   targetTitle: string;
   targetSubtitle: string;
   sourceKind: 'local-diff' | 'bitbucket-pr' | 'branch-explore';
+  reviewMode?: ReviewModeStyle;
   acpProfileLabel: string;
   viewMode: CodeViewMode;
   voiceMode: VoiceMode;
@@ -231,8 +250,22 @@ export interface SessionMetaState {
   vadSilenceMs: number;
   isPoppedOut: boolean;
   ttsMuted: boolean;
+  autoContinue?: boolean;
   activeEditorFile?: string;
   activeEditorLabel?: string;
+}
+
+export interface ReplayCheckpoint {
+  startIndex: number;
+  segmentCount: number;
+  title: string;
+}
+
+export interface ReplayStatusState {
+  totalSegments: number;
+  isReplaying: boolean;
+  currentIndex?: number;
+  checkpoints: ReplayCheckpoint[];
 }
 
 export type HostToWebviewMessage =
@@ -262,6 +295,8 @@ export type HostToWebviewMessage =
       type: 'whiteboard:syncStack';
       stack: DiagramStackItem[];
       activeIndex?: number;
+      nodes?: DiagramStackItem[];
+      activeId?: string;
     }
   | {
       type: 'chapter:update';
@@ -302,6 +337,10 @@ export type HostToWebviewMessage =
       callers: IncomingCallerItem[];
       source: 'lsp' | 'scan' | 'none';
       note?: string;
+    }
+  | {
+      type: 'replay:status';
+      status: ReplayStatusState;
     };
 
 export type WebviewToHostMessage =
@@ -333,13 +372,22 @@ export type WebviewToHostMessage =
   | { type: 'node:select'; nodeId?: string }
   | { type: 'node:doubleClick'; nodeId: string; codeTarget?: string }
   | { type: 'whiteboard:popTo'; index: number }
+  | { type: 'whiteboard:selectLayer'; id: string }
   | { type: 'ui:toggleViewMode' }
   | { type: 'ui:popOutWindow' }
   | { type: 'ui:toggleVoiceMode'; mode: VoiceMode }
   | { type: 'ui:toggleMute'; muted: boolean }
+  | { type: 'ui:toggleAutoContinue'; enabled: boolean }
   | { type: 'ui:switchTarget' }
   | { type: 'ui:startBranchExplore' }
+  | { type: 'ui:startCorePathReview' }
   | { type: 'ui:publishOrExportNotes' }
+  | {
+      type: 'replay:start';
+      mode: 'from-start' | 'current-section' | 'from-index';
+      startIndex?: number;
+    }
+  | { type: 'replay:stop' }
   | { type: 'ui:addManualNote'; body: string }
   | { type: 'ui:deleteNote'; id: string }
   | { type: 'ui:gotoNote'; file: string; line: number }

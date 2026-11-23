@@ -26,6 +26,10 @@ export class SpeechRegistry {
   private fallbackTts: ITtsProvider = new SystemNativeTts();
   private hasWarnedTtsFallback = false;
   private consecutivePrimaryFailures = 0;
+  private circuitOpenedAtMs: number | null = null;
+  private readonly circuitFailureThreshold: number;
+  private readonly circuitCooldownMs: number;
+  private readonly now: () => number;
 
   constructor(
     private readonly storageDir: string,
@@ -35,12 +39,18 @@ export class SpeechRegistry {
       ttsProvider?: ITtsProvider;
       fallbackTts?: ITtsProvider;
       sttProvider?: ISttProvider;
+      circuitFailureThreshold?: number;
+      circuitCooldownMs?: number;
+      now?: () => number;
     }
   ) {
     this.ttsProvider = overrides?.ttsProvider ?? new EdgeNeuralTts();
     if (overrides?.fallbackTts) {
       this.fallbackTts = overrides.fallbackTts;
     }
+    this.circuitFailureThreshold = overrides?.circuitFailureThreshold ?? 3;
+    this.circuitCooldownMs = overrides?.circuitCooldownMs ?? 30_000;
+    this.now = overrides?.now ?? Date.now;
     this.sttProvider =
       overrides?.sttProvider ??
       new SystemNativeStt({
@@ -55,6 +65,7 @@ export class SpeechRegistry {
     const apiKey = (await this.secrets.get(SPEECH_API_KEY_SECRET)) ?? '';
     this.hasWarnedTtsFallback = false;
     this.consecutivePrimaryFailures = 0;
+    this.circuitOpenedAtMs = null;
 
     this.ttsProvider.dispose?.();
     if (cfg.ttsProvider === 'openai-compat') {
@@ -92,9 +103,15 @@ export class SpeechRegistry {
     options: TtsOptions,
     onFallbackWarning?: (msg: string) => void
   ): Promise<TtsAudioResult> {
+    const isHalfOpenProbe =
+      this.ttsProvider.id !== 'system-native' &&
+      this.circuitOpenedAtMs !== null &&
+      this.now() - this.circuitOpenedAtMs >= this.circuitCooldownMs;
+
     if (
       this.ttsProvider.id !== 'system-native' &&
-      this.consecutivePrimaryFailures >= 2
+      this.circuitOpenedAtMs !== null &&
+      !isHalfOpenProbe
     ) {
       const fbRes = await this.fallbackTts.synthesize(text, options);
       return {
@@ -107,18 +124,29 @@ export class SpeechRegistry {
     try {
       const res = await this.ttsProvider.synthesize(text, options);
       this.consecutivePrimaryFailures = 0;
+      this.circuitOpenedAtMs = null;
+      this.hasWarnedTtsFallback = false;
       return res;
     } catch (err) {
       if (options.signal?.aborted) {
         throw err;
       }
       if (this.ttsProvider.id !== 'system-native') {
-        this.consecutivePrimaryFailures += 1;
+        if (this.circuitOpenedAtMs !== null) {
+          // Half-open probe failed: extend cooldown window before retrying primary again
+          this.circuitOpenedAtMs = this.now();
+        } else {
+          this.consecutivePrimaryFailures += 1;
+          if (this.consecutivePrimaryFailures >= this.circuitFailureThreshold) {
+            this.circuitOpenedAtMs = this.now();
+          }
+        }
         const reason = err instanceof Error ? err.message : String(err);
         if (!this.hasWarnedTtsFallback) {
           this.hasWarnedTtsFallback = true;
+          const cooldownSec = Math.round(this.circuitCooldownMs / 1000);
           onFallbackWarning?.(
-            `Primary TTS (${this.ttsProvider.displayName}) failed (${reason}); falling back to local System Native TTS.`
+            `Primary TTS (${this.ttsProvider.displayName}) failed (${reason}); temporarily using System Native TTS (will auto-probe recovery in ${cooldownSec}s).`
           );
         }
         const fbRes = await this.fallbackTts.synthesize(text, options);

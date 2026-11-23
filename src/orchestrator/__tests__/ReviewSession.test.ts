@@ -11,7 +11,12 @@ import type {
   ReviewNoteDraft,
   UtteranceSegment,
 } from '../../shared/protocol';
-import { detectActionNoteIntent } from '../PromptTemplates';
+import {
+  buildCorePathLineReviewInitialPrompt,
+  buildCorePathLineReviewSystemPrompt,
+  buildUserFollowUpPrompt,
+  detectActionNoteIntent,
+} from '../PromptTemplates';
 import {
   calibrateNodeLineFromContent,
   isNoiseCallerPath,
@@ -35,6 +40,7 @@ const BASE_CONFIG: ReviewSessionRuntimeConfig = {
   vadSilenceMs: 900,
   maxContextChars: 12000,
   ignorePatterns: [],
+  autoContinue: false,
 };
 
 const SAMPLE_TARGET: ReviewTarget = {
@@ -1670,6 +1676,804 @@ describe('ReviewSession orchestration & exact barge-in', () => {
     );
     expect(callersRes?.callers[0].symbol).toBe('SessionRouter.dispatch');
     expect(callersRes?.note).toContain('过滤');
+
+    session.dispose();
+  });
+
+  it('supports agent in-place wb_render mode="update", tree outline in follow-up prompts, and whiteboard:selectLayer', async () => {
+    const sentMessages: HostToWebviewMessage[] = [];
+    const seenPrompts: string[] = [];
+    let turnCount = 0;
+
+    const session = new ReviewSession(
+      {
+        acpClient: {
+          connect: vi.fn().mockResolvedValue({
+            profile: { id: 'agy', name: 'agy', command: 'agy', args: ['acp'] },
+            initResult: { protocolVersion: 1 },
+            sessionResult: { sessionId: 's-tree' },
+            configOptions: [],
+            modelResolution: {
+              requestedThoughtLevel: 'low',
+              resolvedModel: 'gemini-4-hydrogen',
+              resolvedThoughtLevel: 'low',
+              matchedRequestedModel: true,
+              availableModels: ['gemini-4-hydrogen'],
+            },
+          }),
+          sendPrompt: vi.fn(async (promptText: string, cb: AcpPromptCallbacks): Promise<AcpPromptResult> => {
+            seenPrompts.push(promptText);
+            turnCount += 1;
+            if (turnCount === 1) {
+              cb.onTextDelta(
+                '<wb_render id="l1" title="全局总览" mode="replace">flowchart LR\n  A --> B\n</wb_render>' +
+                  '先看全局架构与整体流程。' +
+                  '<wb_render id="l2-a" title="分支 A" mode="push">flowchart LR\n  B --> C\n</wb_render>' +
+                  '再展开看分支 A 的核心实现。'
+              );
+            } else {
+              cb.onTextDelta(
+                '<wb_render mode="update" target="l1" title="全局总览（补充完整）">flowchart LR\n  A --> B & D\n</wb_render>' +
+                  '已原地更新 L1 全局架构图。'
+              );
+            }
+            return { stopReason: 'end_turn' };
+          }),
+          cancel: vi.fn(),
+          dispose: vi.fn(),
+        },
+        contextPackBuilder: { build: vi.fn().mockResolvedValue(SAMPLE_PACK) },
+        speech: {
+          synthesizeWithFallback: vi.fn(async (text: string) => ({
+            audioBase64: Buffer.from(text).toString('base64'),
+            mimeType: 'audio/mpeg',
+          })),
+          transcribe: vi.fn().mockResolvedValue(''),
+        },
+        whiteboard: {
+          openOrReveal: vi.fn(),
+          popOutToWindow: vi.fn().mockResolvedValue(undefined),
+          postMessage: (msg) => sentMessages.push(msg),
+        },
+        codeNavigator: {
+          navigateTo: vi.fn().mockResolvedValue({ file: 'src/auth.ts', view: 'source' }),
+          toggleViewMode: vi.fn().mockResolvedValue('source'),
+          getCurrentViewMode: () => 'source',
+          getCurrentLocation: () => undefined,
+        },
+        comments: { addDraft: vi.fn(), listDrafts: () => [], clear: vi.fn() },
+        actions: {
+          onSwitchTarget: vi.fn().mockResolvedValue(undefined),
+          onPublishOrExportNotes: vi.fn().mockResolvedValue(undefined),
+        },
+      },
+      BASE_CONFIG
+    );
+
+    await session.start(SAMPLE_TARGET);
+    await new Promise((r) => setTimeout(r, 40));
+
+    const segs = sentMessages
+      .filter((m): m is Extract<HostToWebviewMessage, { type: 'audio:enqueue' }> => m.type === 'audio:enqueue')
+      .map((m) => m.payload.segment);
+    await session.handleWebviewMessage({ type: 'playback:segmentStarted', segment: segs[0] });
+    await session.handleWebviewMessage({ type: 'playback:segmentEnded', segment: segs[0] });
+    await session.handleWebviewMessage({ type: 'playback:segmentStarted', segment: segs[1] });
+    await session.handleWebviewMessage({ type: 'playback:segmentEnded', segment: segs[1] });
+    await session.handleWebviewMessage({ type: 'playback:queueEmpty', turnId: segs[1].turnId });
+
+    // Ask follow-up while on l2-a -> prompt carries treeOutline and mode="update" instructions
+    await session.handleUserQuestion('把 L1 全局图再补充完整一点', undefined, 'text');
+    await new Promise((r) => setTimeout(r, 40));
+    expect(seenPrompts[1]).toContain('当前白板树状结构 (L1~L4)');
+    expect(seenPrompts[1]).toContain('id="l1"');
+    expect(seenPrompts[1]).toContain('id="l2-a"');
+
+    // Run segment of turn 2 and trigger webview:ready sync to inspect updated tree
+    const turn2Seg = sentMessages
+      .filter((m): m is Extract<HostToWebviewMessage, { type: 'audio:enqueue' }> => m.type === 'audio:enqueue')
+      .map((m) => m.payload.segment)
+      .at(-1)!;
+    await session.handleWebviewMessage({ type: 'playback:segmentStarted', segment: turn2Seg });
+    await session.handleWebviewMessage({ type: 'webview:ready' });
+
+    const synced = [...sentMessages]
+      .reverse()
+      .find(
+        (m): m is Extract<HostToWebviewMessage, { type: 'whiteboard:syncStack' }> =>
+          m.type === 'whiteboard:syncStack'
+      );
+    expect(synced?.activeId).toBe('l1');
+    expect(synced?.nodes?.find((n) => n.id === 'l1')).toMatchObject({
+      title: '全局总览（补充完整）',
+      revision: 2,
+    });
+    expect(synced?.stack.map((n) => n.id)).toEqual(['l1', 'l2-a']);
+    expect(synced?.activeIndex).toBe(0);
+
+    // Selecting l2-a via whiteboard:selectLayer moves activeId to l2-a
+    await session.handleWebviewMessage({ type: 'whiteboard:selectLayer', id: 'l2-a' });
+    const afterSelect = [...sentMessages]
+      .reverse()
+      .find(
+        (m): m is Extract<HostToWebviewMessage, { type: 'whiteboard:syncStack' }> =>
+          m.type === 'whiteboard:syncStack'
+      );
+    expect(afterSelect?.activeId).toBe('l2-a');
+    expect(afterSelect?.activeIndex).toBe(1);
+
+    session.dispose();
+  });
+
+  it('supports input-driven core-path line-by-line review mode with auto sub-method jump, on-demand whiteboard deepening, and continuation', async () => {
+    expect(buildCorePathLineReviewSystemPrompt()).toContain('基于输入的核心链路逐行 Review');
+    const previewPrompt = buildCorePathLineReviewInitialPrompt('repo-pack', '追踪 POST /orders 扣库存链路', {
+      file: 'src/api/orders.ts',
+      line: 18,
+      endLine: 22,
+      selectedSnippet: 'const ok = await reserveStock(req.items);',
+    });
+    expect(previewPrompt).toContain('追踪 POST /orders 扣库存链路');
+    expect(previewPrompt).toContain('src/api/orders.ts (第 18-22 行)');
+    expect(previewPrompt).toContain('reserveStock');
+
+    const sentMessages: HostToWebviewMessage[] = [];
+    const seenPrompts: string[] = [];
+    const navCalls: CodeGotoDirective[] = [];
+    let connectSysPrompt = '';
+    const onStartCorePathSpy = vi.fn().mockResolvedValue(undefined);
+
+    const corePathTarget: BranchExploreTarget = {
+      kind: 'branch-explore',
+      repoRoot: '/tmp/repo',
+      branchName: 'main',
+      baseRef: 'HEAD',
+      effectiveBaseRef: 'HEAD',
+      headRef: 'HEAD',
+      title: 'repo (main)',
+      subtitle: '核心链路逐行 Review · 追踪 POST /orders 扣库存链路',
+      initialInstruction: '追踪 POST /orders 扣库存链路',
+      startMode: 'core-path-line-review',
+      entryHint: {
+        file: 'src/api/orders.ts',
+        line: 18,
+        endLine: 22,
+        selectedSnippet: 'const ok = await reserveStock(req.items);',
+      },
+    };
+
+    let turnCount = 0;
+    const session = new ReviewSession(
+      {
+        acpClient: {
+          connect: vi.fn(async (opts) => {
+            connectSysPrompt = opts.systemPromptAppend;
+            return {
+              profile: { id: 'agy', name: 'agy', command: 'agy', args: ['acp'] },
+              initResult: { protocolVersion: 1 },
+              sessionResult: { sessionId: 's-core-path' },
+              configOptions: [],
+              modelResolution: {
+                requestedThoughtLevel: 'low',
+                resolvedModel: 'gemini-4-hydrogen',
+                resolvedThoughtLevel: 'low',
+                matchedRequestedModel: true,
+                availableModels: ['gemini-4-hydrogen'],
+              },
+            };
+          }),
+          sendPrompt: vi.fn(async (promptText: string, cb: AcpPromptCallbacks): Promise<AcpPromptResult> => {
+            seenPrompts.push(promptText);
+            turnCount += 1;
+            if (turnCount === 1) {
+              cb.onTextDelta(
+                '<wb_render id="core_path" title="核心链路：下单扣库存" mode="replace">sequenceDiagram\n  API->>Inv: reserveStock()\n</wb_render>' +
+                  '<call_chain title="下单扣库存链路">\n* OrderApi.create | src/api/orders.ts:18 | 参数校验并调用扣库存\nInventorySvc.reserve | src/services/inventory.ts:40 | 原子扣减库存\n</call_chain>' +
+                  '<code_goto file="src/api/orders.ts" lines="18-23" view="source" label="OrderApi.create — 参数校验"/>' +
+                  '先看入口第 18 到 23 行的鉴权与下单参数分支判断。' +
+                  '<wb_render id="sub-inv" parent="core_path" title="子方法：InventorySvc.reserve" mode="push">flowchart TD\n  Check --> Deduct\n</wb_render>' +
+                  '<code_goto file="src/services/inventory.ts" lines="40-46" view="source" label="InventorySvc.reserve — 核心分支"/>' +
+                  '自动跳入库存服务第 40 到 46 行，我们把白板深化到 L2 看里面的并发分支。' +
+                  '<wb_pop/>' +
+                  '<code_goto file="src/api/orders.ts" lines="25-30" view="source" label="OrderApi.create — 返回结果"/>' +
+                  '回到入口第 25 到 30 行继续往下检查返回值，这里先停下等你确认。'
+              );
+            } else {
+              cb.onTextDelta(
+                '<code_goto file="src/api/orders.ts" lines="31-37" view="source" label="OrderApi.create — 异常兜底"/>' +
+                  '继续往第 31 到 37 行看异常分支处理。'
+              );
+            }
+            return { stopReason: 'end_turn' };
+          }),
+          cancel: vi.fn(),
+          dispose: vi.fn(),
+        },
+        contextPackBuilder: { build: vi.fn().mockResolvedValue(SAMPLE_PACK) },
+        speech: {
+          synthesizeWithFallback: vi.fn(async (text: string) => ({
+            audioBase64: Buffer.from(text).toString('base64'),
+            mimeType: 'audio/mpeg',
+          })),
+          transcribe: vi.fn().mockResolvedValue(''),
+        },
+        whiteboard: {
+          openOrReveal: vi.fn(),
+          popOutToWindow: vi.fn().mockResolvedValue(undefined),
+          postMessage: (msg) => sentMessages.push(msg),
+        },
+        codeNavigator: {
+          navigateTo: vi.fn(async (cmd) => {
+            navCalls.push(cmd);
+            return { file: cmd.file, lines: cmd.lines, view: cmd.view ?? 'source', label: cmd.label };
+          }),
+          toggleViewMode: vi.fn().mockResolvedValue('source'),
+          getCurrentViewMode: () => 'source',
+          getCurrentLocation: () =>
+            navCalls.length > 0
+              ? {
+                  file: navCalls.at(-1)!.file,
+                  lines: navCalls.at(-1)!.lines,
+                  view: 'source' as const,
+                  label: navCalls.at(-1)!.label,
+                }
+              : undefined,
+        },
+        comments: { addDraft: vi.fn(), listDrafts: () => [], clear: vi.fn() },
+        actions: {
+          onSwitchTarget: vi.fn().mockResolvedValue(undefined),
+          onStartCorePathReview: onStartCorePathSpy,
+          onPublishOrExportNotes: vi.fn().mockResolvedValue(undefined),
+        },
+      },
+      BASE_CONFIG
+    );
+
+    await session.start(corePathTarget);
+    await new Promise((r) => setTimeout(r, 40));
+
+    expect(connectSysPrompt).toContain('基于输入的核心链路逐行 Review');
+    expect(seenPrompts[0]).toContain('追踪 POST /orders 扣库存链路');
+    expect(seenPrompts[0]).toContain('src/api/orders.ts (第 18-22 行)');
+
+    const modeMetaMsg = sentMessages.find(
+      (m): m is Extract<HostToWebviewMessage, { type: 'session:state' }> =>
+        m.type === 'session:state' && m.meta?.reviewMode === 'core-path-line-review'
+    );
+    expect(modeMetaMsg).toBeDefined();
+
+    const segs = sentMessages
+      .filter((m): m is Extract<HostToWebviewMessage, { type: 'audio:enqueue' }> => m.type === 'audio:enqueue')
+      .map((m) => m.payload.segment);
+    expect(segs.length).toBe(3);
+
+    for (const seg of segs) {
+      await session.handleWebviewMessage({ type: 'playback:segmentStarted', segment: seg });
+      await session.handleWebviewMessage({ type: 'playback:segmentEnded', segment: seg });
+    }
+    await session.handleWebviewMessage({ type: 'playback:queueEmpty', turnId: segs[2].turnId });
+
+    // Verified line-by-line jump sequence: caller -> sub-method -> caller next chunk
+    expect(navCalls.map((c) => `${c.file}:${c.lines?.start}-${c.lines?.end}`)).toEqual([
+      'src/api/orders.ts:18-23',
+      'src/services/inventory.ts:40-46',
+      'src/api/orders.ts:25-30',
+    ]);
+
+    // Continuing after checkpoint injects core-path-line-review continuation guidance + current lines
+    await session.handleUserQuestion('继续', undefined, 'text');
+    expect(seenPrompts[1]).toContain('核心链路逐行 Review 延续规则');
+    expect(seenPrompts[1]).toContain('src/api/orders.ts (行 25-30)');
+    expect(seenPrompts[1]).toContain('id="sub-inv"');
+
+    // Also test standalone follow-up prompt helper directly
+    const standalone = buildUserFollowUpPrompt('继续往下', {
+      diagramId: 'core_path',
+      editorFile: 'src/api/orders.ts',
+      editorLines: { start: 25, end: 30 },
+      mode: 'core-path-line-review',
+    });
+    expect(standalone).toContain('核心链路逐行 Review 延续规则');
+
+    await session.handleWebviewMessage({ type: 'ui:startCorePathReview' });
+    expect(onStartCorePathSpy).toHaveBeenCalledTimes(1);
+
+    session.dispose();
+  });
+
+  it('auto-continues seamlessly using lookahead prefetch buffer without asking to continue and stops on <walkthrough_done/>', async () => {
+    const sentMessages: HostToWebviewMessage[] = [];
+    const seenPrompts: string[] = [];
+    let callIdx = 0;
+
+    const session = new ReviewSession(
+      {
+        acpClient: {
+          connect: vi.fn().mockResolvedValue({
+            profile: { id: 'agy', name: 'agy', command: 'agy', args: ['acp'] },
+            initResult: { protocolVersion: 1 },
+            sessionResult: { sessionId: 's-auto' },
+            configOptions: [],
+          }),
+          sendPrompt: vi.fn(async (promptText: string, cb: AcpPromptCallbacks): Promise<AcpPromptResult> => {
+            seenPrompts.push(promptText);
+            callIdx += 1;
+            if (callIdx === 1) {
+              cb.onTextDelta(
+                '<chapter index="1" total="2" title="L1 全局总览"/>' +
+                  '<wb_render id="l1" title="全局架构" mode="replace">flowchart LR\n  A --> B\n</wb_render>' +
+                  '<code_goto file="src/auth.ts" lines="1-5" view="source"/>' +
+                  '第一段先看全局入口设计。' +
+                  '第二段看入口参数基础校验逻辑。' +
+                  '第三段看如何构造初始上下文对象。'
+              );
+            } else {
+              cb.onTextDelta(
+                '<chapter index="2" total="2" title="L2 核心模块"/>' +
+                  '<wb_render id="l2" parent="l1" title="Auth 子模块" mode="push">flowchart TD\n  B --> C\n</wb_render>' +
+                  '<code_goto file="src/auth.ts" lines="20-26" view="source"/>' +
+                  '紧接着进入第二章核心模块分析。' +
+                  '整条链路已经完整收尾。<walkthrough_done/>'
+              );
+            }
+            return { stopReason: 'end_turn' };
+          }),
+          cancel: vi.fn(),
+          dispose: vi.fn(),
+        },
+        contextPackBuilder: { build: vi.fn().mockResolvedValue(SAMPLE_PACK) },
+        speech: {
+          synthesizeWithFallback: vi.fn(async (text: string) => ({
+            audioBase64: Buffer.from(text).toString('base64'),
+            mimeType: 'audio/mpeg',
+          })),
+          transcribe: vi.fn().mockResolvedValue(''),
+        },
+        whiteboard: {
+          openOrReveal: vi.fn(),
+          popOutToWindow: vi.fn().mockResolvedValue(undefined),
+          postMessage: (msg) => sentMessages.push(msg),
+        },
+        codeNavigator: {
+          navigateTo: vi.fn(async (cmd) => ({
+            file: cmd.file,
+            lines: cmd.lines,
+            view: cmd.view ?? 'source',
+            label: cmd.label,
+          })),
+          toggleViewMode: vi.fn().mockResolvedValue('source'),
+          getCurrentViewMode: () => 'source',
+          getCurrentLocation: () => undefined,
+        },
+        comments: { addDraft: vi.fn(), listDrafts: () => [], clear: vi.fn() },
+        actions: {
+          onSwitchTarget: vi.fn().mockResolvedValue(undefined),
+          onPublishOrExportNotes: vi.fn().mockResolvedValue(undefined),
+        },
+      },
+      { ...BASE_CONFIG, autoContinue: true }
+    );
+
+    await session.start(SAMPLE_TARGET);
+    await new Promise((r) => setTimeout(r, 40));
+
+    const chunk1Segs = sentMessages
+      .filter((m): m is Extract<HostToWebviewMessage, { type: 'audio:enqueue' }> => m.type === 'audio:enqueue')
+      .map((m) => m.payload.segment);
+    expect(chunk1Segs.length).toBe(3);
+    const turnId = chunk1Segs[0].turnId;
+    const clearCountBefore = sentMessages.filter((m) => m.type === 'audio:clear').length;
+
+    // Playing segment 1 starts background prefetch of chunk 2 without flushing yet (3-0=3 > watermark 2)
+    await session.handleWebviewMessage({ type: 'playback:segmentStarted', segment: chunk1Segs[0] });
+    await new Promise((r) => setTimeout(r, 40));
+
+    expect(seenPrompts.length).toBe(2);
+    expect(seenPrompts[1]).toContain('系统自动连续推演');
+    // Still buffered cleanly: chunk 2 NOT enqueued yet while 3 segments remain
+    expect(sentMessages.filter((m) => m.type === 'audio:enqueue').length).toBe(3);
+
+    // Finishing segment 1 brings remaining to 3 - 1 = 2 <= watermark 2 -> flushes chunk 2 seamlessly!
+    await session.handleWebviewMessage({ type: 'playback:segmentEnded', segment: chunk1Segs[0] });
+    const allAfterFlush = sentMessages
+      .filter((m): m is Extract<HostToWebviewMessage, { type: 'audio:enqueue' }> => m.type === 'audio:enqueue')
+      .map((m) => m.payload.segment);
+    expect(allAfterFlush.length).toBe(5);
+    expect(allAfterFlush[3].turnId).toBe(turnId);
+    expect(sentMessages.filter((m) => m.type === 'audio:clear').length).toBe(clearCountBefore);
+
+    // Complete all segments -> walkthrough_done stops further prefetch and goes idle cleanly
+    for (const seg of allAfterFlush.slice(1)) {
+      await session.handleWebviewMessage({ type: 'playback:segmentStarted', segment: seg });
+      await session.handleWebviewMessage({ type: 'playback:segmentEnded', segment: seg });
+    }
+    await session.handleWebviewMessage({ type: 'playback:queueEmpty', turnId });
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect(seenPrompts.length).toBe(2);
+    const lastState = [...sentMessages]
+      .reverse()
+      .find((m): m is Extract<HostToWebviewMessage, { type: 'session:state' }> => m.type === 'session:state');
+    expect(lastState?.phase).toBe('idle');
+
+    session.dispose();
+  });
+
+  it('holds buffer when paused and discards prefetched buffer cleanly on barge-in', async () => {
+    const sentMessages: HostToWebviewMessage[] = [];
+    const seenPrompts: string[] = [];
+    let callIdx = 0;
+    const cancelSpy = vi.fn();
+
+    const session = new ReviewSession(
+      {
+        acpClient: {
+          connect: vi.fn().mockResolvedValue({
+            profile: { id: 'agy', name: 'agy', command: 'agy', args: ['acp'] },
+            initResult: { protocolVersion: 1 },
+            sessionResult: { sessionId: 's-pause-cancel' },
+            configOptions: [],
+          }),
+          sendPrompt: vi.fn(async (promptText: string, cb: AcpPromptCallbacks): Promise<AcpPromptResult> => {
+            seenPrompts.push(promptText);
+            callIdx += 1;
+            if (callIdx === 1) {
+              cb.onTextDelta(
+                '<wb_render id="l1" title="全局图" mode="replace">flowchart LR\n  A --> B\n</wb_render>' +
+                  '这是第一轮的第一段讲解内容。' +
+                  '这是第一轮的第二段讲解内容。' +
+                  '这是第一轮的第三段讲解内容。'
+              );
+            } else if (callIdx === 2) {
+              // Speculative prefetch chunk 2 that will get buffered then discarded on interrupt
+              cb.onTextDelta(
+                '<wb_render id="l2-stale" title="被废弃预缓冲" mode="push">flowchart LR\n  X --> Y\n</wb_render>' +
+                  '这段是提前缓冲但尚未播报的章节。'
+              );
+            } else {
+              cb.onTextDelta(
+                '<wb_render id="l2-fresh" title="按打断新生成" mode="push">flowchart LR\n  B --> Z\n</wb_render>' +
+                  '根据你的打断提问重新生成这段解答。<walkthrough_done/>'
+              );
+            }
+            return { stopReason: 'end_turn' };
+          }),
+          cancel: cancelSpy,
+          dispose: vi.fn(),
+        },
+        contextPackBuilder: { build: vi.fn().mockResolvedValue(SAMPLE_PACK) },
+        speech: {
+          synthesizeWithFallback: vi.fn(async (text: string) => ({
+            audioBase64: Buffer.from(text).toString('base64'),
+            mimeType: 'audio/mpeg',
+          })),
+          transcribe: vi.fn().mockResolvedValue(''),
+        },
+        whiteboard: {
+          openOrReveal: vi.fn(),
+          popOutToWindow: vi.fn().mockResolvedValue(undefined),
+          postMessage: (msg) => sentMessages.push(msg),
+        },
+        codeNavigator: {
+          navigateTo: vi.fn().mockResolvedValue({ file: 'src/auth.ts', view: 'source' }),
+          toggleViewMode: vi.fn().mockResolvedValue('source'),
+          getCurrentViewMode: () => 'source',
+          getCurrentLocation: () => undefined,
+        },
+        comments: { addDraft: vi.fn(), listDrafts: () => [], clear: vi.fn() },
+        actions: {
+          onSwitchTarget: vi.fn().mockResolvedValue(undefined),
+          onPublishOrExportNotes: vi.fn().mockResolvedValue(undefined),
+        },
+      },
+      { ...BASE_CONFIG, autoContinue: true }
+    );
+
+    await session.start(SAMPLE_TARGET);
+    await new Promise((r) => setTimeout(r, 40));
+    const segs = sentMessages
+      .filter((m): m is Extract<HostToWebviewMessage, { type: 'audio:enqueue' }> => m.type === 'audio:enqueue')
+      .map((m) => m.payload.segment);
+
+    // Start seg 1 -> prefetch chunk 2 fills buffer
+    await session.handleWebviewMessage({ type: 'playback:segmentStarted', segment: segs[0] });
+    await new Promise((r) => setTimeout(r, 40));
+    expect(seenPrompts.length).toBe(2);
+
+    // User pauses before finishing seg 1 -> ending seg 1 MUST NOT flush buffered chunk 2 while paused
+    await session.handleWebviewMessage({ type: 'playback:paused' });
+    await session.handleWebviewMessage({ type: 'playback:segmentEnded', segment: segs[0] });
+    expect(sentMessages.filter((m) => m.type === 'audio:enqueue').length).toBe(3);
+
+    // User asks a new question -> discards stale buffer (l2-stale) and regenerates fresh (l2-fresh)
+    await session.handleUserQuestion('别讲后面了，直接讲 Z 模块怎么校验', undefined, 'text');
+    await new Promise((r) => setTimeout(r, 40));
+
+    expect(seenPrompts.length).toBe(3);
+    expect(seenPrompts[2]).not.toContain('l2-stale');
+    await session.handleWebviewMessage({ type: 'webview:ready' });
+    const latestSync = [...sentMessages]
+      .reverse()
+      .find((m): m is Extract<HostToWebviewMessage, { type: 'whiteboard:syncStack' }> => m.type === 'whiteboard:syncStack');
+    expect(latestSync?.nodes?.some((n) => n.id === 'l2-stale')).toBe(false);
+
+    session.dispose();
+  });
+
+  it('replays recorded session timeline cleanly from start or checkpoint without extra LLM/TTS calls or duplicate notes', async () => {
+    const sentMessages: HostToWebviewMessage[] = [];
+    const navCalls: CodeGotoDirective[] = [];
+    const addDraftSpy = vi.fn(() => ({
+      id: 'n1',
+      file: 'src/auth.ts',
+      line: 12,
+      severity: 'action' as const,
+      body: '补充空值检查',
+      createdAt: '2026-11-23T00:00:00Z',
+    }));
+    const sendPromptSpy = vi.fn(async (_text: string, cb: AcpPromptCallbacks): Promise<AcpPromptResult> => {
+      cb.onTextDelta(
+        '<chapter index="1" total="2" title="第一章 总览"/>' +
+          '<wb_render id="l1" title="L1 总览" mode="replace">flowchart LR\n  A --> B\n</wb_render>' +
+          '<code_goto file="src/auth.ts" lines="1-5" view="source"/>' +
+          '<review_note file="src/auth.ts" line="12" severity="action">补充空值检查</review_note>' +
+          '先看第一章整体流程。<chapter index="2" total="2" title="第二章 细节"/>' +
+          '<wb_render id="l2" title="L2 细节" mode="push">flowchart TD\n  B --> C\n</wb_render>' +
+          '<code_goto file="src/auth.ts" lines="20-25" view="source"/>' +
+          '再看第二章局部实现。<walkthrough_done/>'
+      );
+      return { stopReason: 'end_turn' };
+    });
+    const synthSpy = vi.fn(async (text: string) => ({
+      audioBase64: Buffer.from(text).toString('base64'),
+      mimeType: 'audio/mpeg',
+    }));
+
+    const session = new ReviewSession(
+      {
+        acpClient: {
+          connect: vi.fn().mockResolvedValue({
+            profile: { id: 'agy', name: 'agy', command: 'agy', args: ['acp'] },
+            initResult: { protocolVersion: 1 },
+            sessionResult: { sessionId: 's-replay' },
+            configOptions: [],
+          }),
+          sendPrompt: sendPromptSpy,
+          cancel: vi.fn(),
+          dispose: vi.fn(),
+        },
+        contextPackBuilder: { build: vi.fn().mockResolvedValue(SAMPLE_PACK) },
+        speech: {
+          synthesizeWithFallback: synthSpy,
+          transcribe: vi.fn().mockResolvedValue(''),
+        },
+        whiteboard: {
+          openOrReveal: vi.fn(),
+          popOutToWindow: vi.fn().mockResolvedValue(undefined),
+          postMessage: (msg) => sentMessages.push(msg),
+        },
+        codeNavigator: {
+          navigateTo: vi.fn(async (cmd) => {
+            navCalls.push(cmd);
+            return { file: cmd.file, lines: cmd.lines, view: cmd.view ?? 'source', label: cmd.label };
+          }),
+          toggleViewMode: vi.fn().mockResolvedValue('source'),
+          getCurrentViewMode: () => 'source',
+          getCurrentLocation: () => undefined,
+        },
+        comments: { addDraft: addDraftSpy, listDrafts: () => [], clear: vi.fn() },
+        actions: {
+          onSwitchTarget: vi.fn().mockResolvedValue(undefined),
+          onPublishOrExportNotes: vi.fn().mockResolvedValue(undefined),
+        },
+      },
+      { ...BASE_CONFIG, autoContinue: false }
+    );
+
+    await session.start(SAMPLE_TARGET);
+    await new Promise((r) => setTimeout(r, 40));
+
+    const origSegs = sentMessages
+      .filter((m): m is Extract<HostToWebviewMessage, { type: 'audio:enqueue' }> => m.type === 'audio:enqueue')
+      .map((m) => m.payload.segment);
+    expect(origSegs.length).toBe(2);
+
+    for (const s of origSegs) {
+      await session.handleWebviewMessage({ type: 'playback:segmentStarted', segment: s });
+      await session.handleWebviewMessage({ type: 'playback:segmentEnded', segment: s });
+    }
+    await session.handleWebviewMessage({ type: 'playback:queueEmpty', turnId: origSegs[1].turnId });
+
+    expect(sendPromptSpy).toHaveBeenCalledTimes(1);
+    expect(synthSpy).toHaveBeenCalledTimes(2);
+    expect(addDraftSpy).toHaveBeenCalledTimes(1);
+
+    const replayStatus = [...sentMessages]
+      .reverse()
+      .find((m): m is Extract<HostToWebviewMessage, { type: 'replay:status' }> => m.type === 'replay:status');
+    expect(replayStatus?.status.totalSegments).toBe(2);
+    expect(replayStatus?.status.checkpoints.map((c) => c.title)).toEqual([
+      '第一章 总览',
+      '第二章 细节',
+    ]);
+
+    // Trigger replay from checkpoint #2 (index 1) -> restores L1 pre-state first without calling LLM/TTS
+    const msgCountBeforeReplay = sentMessages.length;
+    await session.handleWebviewMessage({
+      type: 'replay:start',
+      mode: 'from-index',
+      startIndex: 1,
+    });
+
+    expect(sendPromptSpy).toHaveBeenCalledTimes(1);
+    expect(synthSpy).toHaveBeenCalledTimes(2);
+
+    const replaySlice = sentMessages.slice(msgCountBeforeReplay);
+    const syncedPreState = replaySlice.find(
+      (m): m is Extract<HostToWebviewMessage, { type: 'whiteboard:syncStack' }> =>
+        m.type === 'whiteboard:syncStack'
+    );
+    expect(syncedPreState?.activeId).toBe('l1');
+
+    const replayedEnqueues = replaySlice
+      .filter((m): m is Extract<HostToWebviewMessage, { type: 'audio:enqueue' }> => m.type === 'audio:enqueue')
+      .map((m) => m.payload.segment);
+    expect(replayedEnqueues.length).toBe(1);
+
+    // Playing replayed segment navigates code & pushes L2, without duplicating review notes
+    const navCountBefore = navCalls.length;
+    await session.handleWebviewMessage({
+      type: 'playback:segmentStarted',
+      segment: replayedEnqueues[0],
+    });
+    expect(navCalls.length).toBe(navCountBefore + 1);
+    expect(navCalls.at(-1)?.lines).toEqual({ start: 20, end: 25 });
+    expect(addDraftSpy).toHaveBeenCalledTimes(1);
+
+    // Stop replay explicitly
+    await session.handleWebviewMessage({ type: 'replay:stop' });
+    const stoppedStatus = [...sentMessages]
+      .reverse()
+      .find((m): m is Extract<HostToWebviewMessage, { type: 'replay:status' }> => m.type === 'replay:status');
+    expect(stoppedStatus?.status.isReplaying).toBe(false);
+
+    // Replay from start cleanly queues all 2 segments
+    await session.handleWebviewMessage({ type: 'replay:start', mode: 'from-start' });
+    const allFromStart = sentMessages
+      .filter((m): m is Extract<HostToWebviewMessage, { type: 'audio:enqueue' }> => m.type === 'audio:enqueue')
+      .slice(-2);
+    expect(allFromStart.length).toBe(2);
+    expect(addDraftSpy).toHaveBeenCalledTimes(1);
+
+    session.dispose();
+  });
+
+  it('auto-retries with agent silently on telemetry:mermaidError, updates diagram in place without interrupting audio, and enforces max 2 attempts', async () => {
+    const sentMessages: HostToWebviewMessage[] = [];
+    const seenPrompts: string[] = [];
+    const synthSpy = vi.fn(async (text: string) => ({
+      audioBase64: Buffer.from(text).toString('base64'),
+      mimeType: 'audio/mpeg',
+    }));
+
+    let callIdx = 0;
+    const sendPromptSpy = vi.fn(async (promptText: string, cb: AcpPromptCallbacks): Promise<AcpPromptResult> => {
+      seenPrompts.push(promptText);
+      callIdx += 1;
+      if (callIdx === 1) {
+        cb.onTextDelta(
+          '<wb_render id="l1" title="下单主链路" mode="replace" map=\'{"N2":"src/order.ts:10-18"}\'>' +
+            'flowchart TD\n  N1["Start"] --> N2["下单 & 接收回执"]\n</wb_render>' +
+            '先看下单主链路。'
+        );
+      } else {
+        // Silent repair response: only outputs <wb_render mode="update" target="l1"> with no spoken prose
+        cb.onTextDelta(
+          `<wb_render id="l1" target="l1" title="下单主链路" mode="update">flowchart TD\n  N1["Start"] --> N2["下单 & 接收回执"]\n  Note1["📝 每 lane 独立串行 (已修复 v${callIdx})"] -.-> N2\n</wb_render>`
+        );
+      }
+      return { stopReason: 'end_turn' };
+    });
+
+    const session = new ReviewSession(
+      {
+        acpClient: {
+          connect: vi.fn().mockResolvedValue({
+            profile: { id: 'agy', name: 'agy', command: 'agy', args: ['acp'] },
+            initResult: { protocolVersion: 1 },
+            sessionResult: { sessionId: 's-mermaid-repair' },
+            configOptions: [],
+          }),
+          sendPrompt: sendPromptSpy,
+          cancel: vi.fn(),
+          dispose: vi.fn(),
+        },
+        contextPackBuilder: { build: vi.fn().mockResolvedValue(SAMPLE_PACK) },
+        speech: {
+          synthesizeWithFallback: synthSpy,
+          transcribe: vi.fn().mockResolvedValue(''),
+        },
+        whiteboard: {
+          openOrReveal: vi.fn(),
+          popOutToWindow: vi.fn().mockResolvedValue(undefined),
+          postMessage: (msg) => sentMessages.push(msg),
+        },
+        codeNavigator: {
+          navigateTo: vi.fn().mockResolvedValue({ file: 'src/order.ts', view: 'source' }),
+          toggleViewMode: vi.fn().mockResolvedValue('source'),
+          getCurrentViewMode: () => 'source',
+          getCurrentLocation: () => undefined,
+        },
+        comments: { addDraft: vi.fn(), listDrafts: () => [], clear: vi.fn() },
+        actions: {
+          onSwitchTarget: vi.fn().mockResolvedValue(undefined),
+          onPublishOrExportNotes: vi.fn().mockResolvedValue(undefined),
+        },
+      },
+      BASE_CONFIG
+    );
+
+    await session.start(SAMPLE_TARGET);
+    await new Promise((r) => setTimeout(r, 40));
+
+    const seg1 = sentMessages
+      .filter((m): m is Extract<HostToWebviewMessage, { type: 'audio:enqueue' }> => m.type === 'audio:enqueue')
+      .map((m) => m.payload.segment)[0];
+    await session.handleWebviewMessage({ type: 'playback:segmentStarted', segment: seg1 });
+
+    const clearsBefore = sentMessages.filter((m) => m.type === 'audio:clear').length;
+    const synthBefore = synthSpy.mock.calls.length;
+
+    // Webview hits Mermaid parse error -> triggers silent Agent repair
+    await session.handleWebviewMessage({
+      type: 'telemetry:mermaidError',
+      diagramId: 'l1',
+      error: 'Parse error on line 3: unexpected Note',
+      mermaidCode: 'flowchart TD\n  N1 --> N2\n  Note right of N2: 每 lane',
+    });
+    await new Promise((r) => setTimeout(r, 40));
+
+    expect(sendPromptSpy).toHaveBeenCalledTimes(2);
+    expect(seenPrompts[1]).toContain('系统自动语法修复请求');
+    expect(seenPrompts[1]).toContain('id="l1"');
+    expect(seenPrompts[1]).toContain('Parse error on line 3');
+
+    // No audio interruption & no extra TTS calls
+    expect(sentMessages.filter((m) => m.type === 'audio:clear').length).toBe(clearsBefore);
+    expect(synthSpy).toHaveBeenCalledTimes(synthBefore);
+
+    const syncedAfterRepair1 = [...sentMessages]
+      .reverse()
+      .find(
+        (m): m is Extract<HostToWebviewMessage, { type: 'whiteboard:syncStack' }> =>
+          m.type === 'whiteboard:syncStack'
+      );
+    expect(syncedAfterRepair1?.nodes?.length).toBe(1);
+    expect(syncedAfterRepair1?.nodes?.[0]).toMatchObject({
+      id: 'l1',
+      revision: 2,
+      nodeCodeMap: { N2: 'src/order.ts:10-18' },
+    });
+    expect(syncedAfterRepair1?.nodes?.[0].mermaidCode).toContain('已修复 v2');
+
+    // 2nd error still retries once; 3rd error is capped at MAX_MERMAID_REPAIR_ATTEMPTS = 2
+    await session.handleWebviewMessage({
+      type: 'telemetry:mermaidError',
+      diagramId: 'l1',
+      error: 'Another error',
+      mermaidCode: 'flowchart TD\n  bad',
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    expect(sendPromptSpy).toHaveBeenCalledTimes(3);
+
+    await session.handleWebviewMessage({
+      type: 'telemetry:mermaidError',
+      diagramId: 'l1',
+      error: 'Third error should stop',
+      mermaidCode: 'flowchart TD\n  bad',
+    });
+    await new Promise((r) => setTimeout(r, 40));
+    expect(sendPromptSpy).toHaveBeenCalledTimes(3);
 
     session.dispose();
   });

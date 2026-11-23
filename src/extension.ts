@@ -11,6 +11,7 @@ import type {
   BitbucketPrTarget,
   BitbucketRemoteInfo,
   BranchExploreTarget,
+  CorePathEntryHint,
   LocalDiffTarget,
   ReviewTarget,
 } from './context/types';
@@ -151,6 +152,32 @@ export function activate(context: vscode.ExtensionContext): void {
         message: msg,
       });
       void vscode.window.showErrorMessage(`当前分支导读启动失败: ${msg}`);
+      updateStatusBar('error');
+    }
+  };
+
+  const startCorePathReviewFlow = async (presetInput?: string): Promise<void> => {
+    try {
+      const folderPath = await resolveWorkspaceFolderPath();
+      if (!folderPath) {
+        return;
+      }
+      const target = await pickCorePathReviewTarget(
+        gitService,
+        folderPath,
+        presetInput
+      );
+      if (!target) {
+        return;
+      }
+      await startSessionWithTarget(target);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      usageLogger.log('session.error', {
+        scope: 'startCorePathReviewFlow',
+        message: msg,
+      });
+      void vscode.window.showErrorMessage(`核心链路逐行 Review 启动失败: ${msg}`);
       updateStatusBar('error');
     }
   };
@@ -462,6 +489,7 @@ export function activate(context: vscode.ExtensionContext): void {
       actions: {
         onSwitchTarget: startReviewFlow,
         onStartBranchExplore: () => startBranchExploreFlow(),
+        onStartCorePathReview: () => startCorePathReviewFlow(),
         onAutoStartBranchExplore: (instruction) => startBranchExploreFlow(instruction),
         getActiveEditorRelPath: (repoRoot) => {
           const editor = vscode.window.activeTextEditor;
@@ -559,6 +587,9 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('reviewAgents.exploreCurrentBranch', () =>
       startBranchExploreFlow()
     ),
+    vscode.commands.registerCommand('reviewAgents.corePathLineReview', () =>
+      startCorePathReviewFlow()
+    ),
     vscode.commands.registerCommand('reviewAgents.openWhiteboard', () => {
       whiteboardPanel.openOrReveal(vscode.ViewColumn.One);
     }),
@@ -573,6 +604,9 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     vscode.commands.registerCommand('reviewAgents.togglePause', () => {
       activeSession?.togglePause();
+    }),
+    vscode.commands.registerCommand('reviewAgents.replayFromStart', () => {
+      activeSession?.startReplay('from-start');
     }),
     vscode.commands.registerCommand('reviewAgents.configureBitbucketToken', async () => {
       await promptAndStoreBitbucketAuth(
@@ -751,6 +785,7 @@ function readRuntimeConfig(): ReviewSessionRuntimeConfig {
     vadSilenceMs: cfg.get<number>('voice.vadSilenceMs', 900),
     maxContextChars: cfg.get<number>('context.maxContextChars', 12000),
     ignorePatterns: cfg.get<string[]>('context.ignorePatterns', []),
+    autoContinue: cfg.get<boolean>('walkthrough.autoContinue', true),
   };
 }
 
@@ -824,6 +859,101 @@ async function resolveWorkspaceFolderPath(): Promise<string | undefined> {
   return selectedFolder.uri.fsPath;
 }
 
+function captureActiveEditorEntryHint(repoRoot: string): CorePathEntryHint | undefined {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor || editor.document.uri.scheme !== 'file') {
+    return undefined;
+  }
+  const rel = path.relative(repoRoot, editor.document.uri.fsPath);
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) {
+    return undefined;
+  }
+  const normalizedFile = rel.replace(/\\/g, '/');
+  const sel = editor.selection;
+  const line = sel.active.line + 1;
+  let endLine: number | undefined;
+  let selectedSnippet: string | undefined;
+
+  if (!sel.isEmpty) {
+    const startLine = Math.min(sel.start.line, sel.end.line) + 1;
+    endLine = Math.max(sel.start.line, sel.end.line) + 1;
+    const raw = editor.document.getText(sel).trim();
+    if (raw) {
+      selectedSnippet = raw.length > 200 ? `${raw.slice(0, 200)}...` : raw;
+    }
+    return {
+      file: normalizedFile,
+      line: startLine,
+      endLine,
+      selectedSnippet,
+    };
+  }
+
+  const cursorLineText = editor.document.lineAt(sel.active.line).text.trim();
+  return {
+    file: normalizedFile,
+    line,
+    selectedSnippet: cursorLineText ? cursorLineText.slice(0, 200) : undefined,
+  };
+}
+
+async function pickCorePathReviewTarget(
+  gitService: GitService,
+  folderPath: string,
+  presetInput?: string
+): Promise<BranchExploreTarget | undefined> {
+  const { repoRoot, isGitRepo } = await gitService.getRepoRootOrFallback(folderPath);
+  const projectName = path.basename(repoRoot) || 'workspace';
+  const branchName = isGitRepo
+    ? await gitService.getCurrentBranch(repoRoot)
+    : projectName;
+  const entryHint = captureActiveEditorEntryHint(repoRoot);
+
+  let userInput = presetInput?.trim() ?? '';
+  if (!userInput) {
+    const hintPlaceholder = entryHint
+      ? `（当前光标位于 ${entryHint.file}:${entryHint.line}，直接回车将从此处开始）`
+      : '例如：用户输入提问 -> ReviewSession.handleUserQuestion / 下单接口 POST /orders 扣库存链路';
+    const raw = await vscode.window.showInputBox({
+      title: `基于输入的核心链路逐行 Review (${branchName})`,
+      prompt: '输入想逐行追踪的业务入口、接口、方法或输入场景（每次看几行核心分支/调用，自动跳入子方法并按需深化白板）',
+      placeHolder: hintPlaceholder,
+      value: entryHint ? `${entryHint.file}:${entryHint.line} ` : '',
+    });
+    if (raw === undefined) {
+      return undefined;
+    }
+    userInput = raw.trim();
+    if (!userInput) {
+      if (entryHint) {
+        userInput = `从当前光标位置 ${entryHint.file}:${entryHint.line} 开始核心链路逐行 Review`;
+      } else {
+        void vscode.window.showInformationMessage(
+          '请输入要追踪的入口方法、场景或先在编辑器中打开一个源文件。'
+        );
+        return undefined;
+      }
+    }
+  }
+
+  const shortInput =
+    userInput.length > 44 ? `${userInput.slice(0, 44)}...` : userInput;
+
+  return {
+    kind: 'branch-explore',
+    repoRoot,
+    branchName,
+    baseRef: 'HEAD',
+    effectiveBaseRef: 'HEAD',
+    headRef: 'HEAD',
+    title: `${projectName} (${branchName})`,
+    subtitle: `核心链路逐行 Review · ${shortInput}`,
+    initialInstruction: userInput,
+    startMode: 'core-path-line-review',
+    entryHint,
+  };
+}
+
 async function pickBranchExploreTarget(
   gitService: GitService,
   folderPath: string,
@@ -856,6 +986,11 @@ async function pickBranchExploreTarget(
   const startPick = await vscode.window.showQuickPick(
     [
       {
+        label: '$(list-tree) 基于输入的核心链路逐行 Review（逐段看核心分支，自动跳子方法 + 深化白板）',
+        description: '从你输入的入口或光标处逐行推演核心调用链',
+        startMode: 'core-path-line-review' as const,
+      },
+      {
         label: '$(edit) 输入自定义指令（按需求 Review 指定模块 / 了解特定功能）',
         description: '推荐 · 指定你想深入的代码区域、链路或 Review 重点',
         startMode: 'instruction' as const,
@@ -879,6 +1014,10 @@ async function pickBranchExploreTarget(
 
   if (!startPick) {
     return undefined;
+  }
+
+  if (startPick.startMode === 'core-path-line-review') {
+    return pickCorePathReviewTarget(gitService, folderPath);
   }
 
   let initialInstruction: string | undefined;
@@ -938,6 +1077,11 @@ async function pickReviewTarget(
   const modePick = await vscode.window.showQuickPick(
     [
       {
+        label: '$(list-tree) Core-Path Line-by-Line Review (基于输入的核心链路逐行 Review)',
+        description: '指定入口或输入场景，逐行审核心分支与调用并自动跳入子方法深化白板',
+        mode: 'core-path-line-review' as const,
+      },
+      {
         label: '$(compass) Current Branch / Project Review & Explore (无需选 PR)',
         description: '直接基于当前分支按指令 Review 指定代码或自顶向下了解项目',
         mode: 'branch-explore' as const,
@@ -961,6 +1105,10 @@ async function pickReviewTarget(
 
   if (!modePick) {
     return undefined;
+  }
+
+  if (modePick.mode === 'core-path-line-review') {
+    return pickCorePathReviewTarget(gitService, folderPath);
   }
 
   if (modePick.mode === 'branch-explore') {

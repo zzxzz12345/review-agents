@@ -7,6 +7,7 @@ import type {
   AgentActivityFileEntry,
   AgentActivityStage,
   AgentActivityState,
+  AudioSegmentPayload,
   CallChainState,
   ChapterProgress,
   CodeGotoDirective,
@@ -17,11 +18,14 @@ import type {
   HostToWebviewMessage,
   InterruptionSnapshot,
   LineRange,
+  ReplayCheckpoint,
+  ReplayStatusState,
   ReviewNoteDraft,
   SessionMetaState,
   SessionPhase,
   UtteranceSegment,
   VoiceMode,
+  WbRenderDirective,
   WebviewPlaybackCutoff,
   WebviewToHostMessage,
 } from '../shared/protocol';
@@ -30,16 +34,30 @@ import { WhisperModelMissingError } from '../speech/stt/SystemNativeStt';
 import type { TtsAudioResult, TtsOptions } from '../speech/types';
 import type { CallChainResolver } from '../vscode-ui/CallChainResolver';
 import { clampHighlightRange } from '../vscode-ui/highlightRange';
-import { DirectiveParser } from './DirectiveParser';
+import { DirectiveParser, sanitizeMermaidCode } from './DirectiveParser';
 import { matchActiveCallChainNode } from './callChainUtils';
 import {
+  buildAutoContinuePrompt,
   buildBranchExploreInitialPrompt,
   buildBranchExploreSystemPrompt,
+  buildCorePathLineReviewInitialPrompt,
+  buildCorePathLineReviewSystemPrompt,
   buildInitialWalkthroughPrompt,
   buildInterruptionPrompt,
+  buildMermaidRepairPrompt,
   buildUserFollowUpPrompt,
   buildWalkthroughSystemPrompt,
 } from './PromptTemplates';
+import {
+  applyWhiteboardDirective,
+  createEmptyWhiteboardTree,
+  deriveActivePath,
+  formatWhiteboardTreeOutline,
+  getActiveDiagram as getActiveTreeDiagram,
+  selectWhiteboardIndex,
+  selectWhiteboardLayer,
+  type WhiteboardTreeState,
+} from '../shared/whiteboardTree';
 
 export interface ReviewSessionRuntimeConfig {
   acpProfile: AcpProfile;
@@ -53,6 +71,7 @@ export interface ReviewSessionRuntimeConfig {
   vadSilenceMs: number;
   maxContextChars: number;
   ignorePatterns: string[];
+  autoContinue?: boolean;
 }
 
 export interface ReviewSessionDependencies {
@@ -128,6 +147,7 @@ export interface ReviewSessionDependencies {
   actions: {
     onSwitchTarget: () => Promise<void>;
     onStartBranchExplore?: () => Promise<void>;
+    onStartCorePathReview?: () => Promise<void>;
     onAutoStartBranchExplore?: (initialInstruction: string) => Promise<void>;
     getActiveEditorRelPath?: (repoRoot: string) => string | undefined;
     onPublishOrExportNotes: () => Promise<void>;
@@ -149,7 +169,30 @@ interface TurnSynthesisEntry {
   promise: Promise<TtsAudioResult>;
 }
 
+interface ReplayPreStateSnapshot {
+  diagramTree: WhiteboardTreeState;
+  callChain: CallChainState | null;
+  chapter?: ChapterProgress;
+}
+
+interface PrefetchedChunk {
+  payloads: AudioSegmentPayload[];
+  walkthroughDone: boolean;
+}
+
+interface ReplayTimelineEntry {
+  index: number;
+  groupId: number;
+  groupTitle: string;
+  payload: AudioSegmentPayload;
+  preState: ReplayPreStateSnapshot;
+}
+
 const MAX_TTS_CONCURRENCY = 2;
+const PREFETCH_MAX_BUFFERED_CHUNKS = 1;
+const PREFETCH_FLUSH_LOW_WATERMARK = 2;
+const MAX_AUTO_CONTINUE_CHUNKS = 8;
+const MAX_MERMAID_REPAIR_ATTEMPTS = 2;
 
 export class ReviewSession {
   private target: ReviewTarget | undefined;
@@ -163,10 +206,10 @@ export class ReviewSession {
   private paused = false;
   private ttsMuted = false;
   private voiceMode: VoiceMode;
+  private autoContinueEnabled: boolean;
 
   private parser = new DirectiveParser(0);
-  private diagramStack: DiagramStackItem[] = [];
-  private activeDiagramIndex = -1;
+  private diagramTree: WhiteboardTreeState = createEmptyWhiteboardTree();
   private diagramArchive: DiagramStackItem[] = [];
   private currentCallChain: CallChainState | null = null;
   private callChainSeq = 0;
@@ -181,6 +224,36 @@ export class ReviewSession {
   private currentPlayingSegment: UtteranceSegment | undefined;
   private currentSegmentStartedAtMs = 0;
   private pendingInterruption: InterruptionSnapshot | undefined;
+  private enqueuedSegmentCount = 0;
+
+  // Lookahead prefetch buffer for continuous auto-advance
+  private walkthroughDone = false;
+  private autoContinueCount = 0;
+  private autoContinueChunkSeq = 0;
+  private prefetchRunning = false;
+  private prefetchAbort: AbortController | null = null;
+  private prefetchGeneration = 0;
+  private prefetchChunks: PrefetchedChunk[] = [];
+
+  // Synchronized timeline & replay state
+  private replayShadowTree: WhiteboardTreeState = createEmptyWhiteboardTree();
+  private replayShadowCallChain: CallChainState | null = null;
+  private replayShadowChapter: ChapterProgress | undefined;
+  private replayTimeline: ReplayTimelineEntry[] = [];
+  private replayGroupSeq = 0;
+  private isReplaying = false;
+  private replayCurrentIndex = -1;
+
+  // Silent Mermaid syntax auto-repair state
+  private mermaidRepairRunning = false;
+  private mermaidRepairAbort: AbortController | null = null;
+  private mermaidRepairGeneration = 0;
+  private mermaidRepairAttempts = new Map<string, number>();
+  private pendingMermaidRepair: {
+    diagramId: string;
+    error: string;
+    mermaidCode: string;
+  } | null = null;
 
   // Extension Host native microphone tracking
   private micActive = false;
@@ -206,10 +279,18 @@ export class ReviewSession {
   ) {
     this.config = initialConfig;
     this.voiceMode = initialConfig.voiceMode;
+    this.autoContinueEnabled = initialConfig.autoContinue ?? true;
   }
 
   public get currentTarget(): ReviewTarget | undefined {
     return this.target;
+  }
+
+  private isCorePathLineReviewTarget(target = this.target): boolean {
+    return (
+      target?.kind === 'branch-explore' &&
+      target.startMode === 'core-path-line-review'
+    );
   }
 
   public get currentContextPack(): ReviewContextPack | undefined {
@@ -223,6 +304,9 @@ export class ReviewSession {
   public updateConfig(next: ReviewSessionRuntimeConfig): void {
     this.config = next;
     this.voiceMode = next.voiceMode;
+    if (next.autoContinue !== undefined) {
+      this.autoContinueEnabled = next.autoContinue;
+    }
     this.deps.mic?.setVoiceMode(this.voiceMode);
     this.deps.mic?.setVadConfig(next.vadBargeInMs, next.vadSilenceMs);
     this.emitSessionState(this.phase);
@@ -248,8 +332,7 @@ export class ReviewSession {
     this.deps.comments.clear();
 
     this.target = target;
-    this.diagramStack = [];
-    this.activeDiagramIndex = -1;
+    this.diagramTree = createEmptyWhiteboardTree();
     this.diagramArchive = [];
     this.currentCallChain = null;
     this.callChainSeq += 1;
@@ -259,12 +342,28 @@ export class ReviewSession {
     this.activeModelResolution = undefined;
     this.manualEditorLocation = undefined;
     this.pendingBranchContextIntro = false;
+    this.walkthroughDone = false;
+    this.autoContinueCount = 0;
+    this.autoContinueChunkSeq = 0;
+    this.enqueuedSegmentCount = 0;
+    this.prefetchChunks = [];
+    this.replayShadowTree = createEmptyWhiteboardTree();
+    this.replayShadowCallChain = null;
+    this.replayShadowChapter = undefined;
+    this.replayTimeline = [];
+    this.replayGroupSeq = 0;
+    this.isReplaying = false;
+    this.replayCurrentIndex = -1;
+    this.mermaidRepairAttempts.clear();
+    this.pendingMermaidRepair = null;
 
     const isBranchExplore = target.kind === 'branch-explore';
+    const isCorePathReview = this.isCorePathLineReviewTarget(target);
 
     // Start UsageLogger BEFORE opening Webview so early webview:ready belongs to this session
     this.deps.logger?.startSession({
       targetKind: target.kind,
+      startMode: isBranchExplore ? target.startMode : undefined,
       targetTitle: target.title,
       acpProfile: this.config.acpProfile.id,
       preferredModel: this.config.preferredModel,
@@ -275,19 +374,25 @@ export class ReviewSession {
     this.deps.whiteboard.openOrReveal();
     this.resetActivity(
       'analyzing',
-      isBranchExplore
-        ? '正在扫描当前分支项目结构与核心文档...'
-        : '正在解析 Git Diff 与类/方法索引...',
+      isCorePathReview
+        ? '正在定位输入入口与核心链路源码...'
+        : isBranchExplore
+          ? '正在扫描当前分支项目结构与核心文档...'
+          : '正在解析 Git Diff 与类/方法索引...',
       target.title,
-      isBranchExplore
-        ? `开始扫描当前分支项目：${target.title}`
-        : `开始解析变更上下文：${target.title}`
+      isCorePathReview
+        ? `开始核心链路逐行 Review：${target.title}`
+        : isBranchExplore
+          ? `开始扫描当前分支项目：${target.title}`
+          : `开始解析变更上下文：${target.title}`
     );
     this.setPhase(
       'analyzing',
-      isBranchExplore
-        ? `正在扫描当前分支：${target.branchName}...`
-        : `正在分析变更上下文：${target.title}...`
+      isCorePathReview && target.kind === 'branch-explore'
+        ? `正在定位核心链路源码：${target.branchName}...`
+        : target.kind === 'branch-explore'
+          ? `正在扫描当前分支：${target.branchName}...`
+          : `正在分析变更上下文：${target.title}...`
     );
 
     const packStartMs = Date.now();
@@ -335,9 +440,11 @@ export class ReviewSession {
     const connectOpts: AcpConnectOptions = {
       cwd: target.repoRoot,
       profile: this.config.acpProfile,
-      systemPromptAppend: isBranchExplore
-        ? buildBranchExploreSystemPrompt()
-        : buildWalkthroughSystemPrompt(),
+      systemPromptAppend: isCorePathReview
+        ? buildCorePathLineReviewSystemPrompt()
+        : isBranchExplore
+          ? buildBranchExploreSystemPrompt()
+          : buildWalkthroughSystemPrompt(),
       thoughtLevel: this.config.thoughtLevel,
       preferredModel: this.config.preferredModel,
       allowMutations: false,
@@ -383,11 +490,8 @@ export class ReviewSession {
     }
 
     this.emitSessionState(this.phase);
-    this.deps.whiteboard.postMessage({
-      type: 'whiteboard:syncStack',
-      stack: [],
-      activeIndex: -1,
-    });
+    this.postSyncWhiteboardTree();
+    this.emitReplayStatus();
     this.deps.whiteboard.postMessage({ type: 'callChain:sync', chain: null });
     this.deps.whiteboard.postMessage({ type: 'notes:sync', notes: [] });
 
@@ -418,8 +522,13 @@ export class ReviewSession {
       this.contextPack,
       this.config.maxContextChars + 4000
     );
-    const initialPrompt =
-      target.kind === 'branch-explore'
+    const initialPrompt = isCorePathReview
+      ? buildCorePathLineReviewInitialPrompt(
+          packMd,
+          target.kind === 'branch-explore' ? (target.initialInstruction ?? '') : '',
+          target.kind === 'branch-explore' ? target.entryHint : undefined
+        )
+      : target.kind === 'branch-explore'
         ? buildBranchExploreInitialPrompt(packMd, target.initialInstruction)
         : buildInitialWalkthroughPrompt(packMd);
     await this.runAcpTurn(initialPrompt, 'initial');
@@ -430,14 +539,11 @@ export class ReviewSession {
       case 'webview:ready': {
         this.deps.logger?.log('webview.ready', {
           phase: this.phase,
-          stackDepth: this.diagramStack.length,
+          stackDepth: this.diagramTree.nodes.length,
         });
         this.emitSessionState(this.phase);
-        this.deps.whiteboard.postMessage({
-          type: 'whiteboard:syncStack',
-          stack: this.diagramStack,
-          activeIndex: this.getClampedDiagramIndex(),
-        });
+        this.postSyncWhiteboardTree();
+        this.emitReplayStatus();
         this.deps.whiteboard.postMessage({
           type: 'callChain:sync',
           chain: this.currentCallChain,
@@ -468,6 +574,14 @@ export class ReviewSession {
         this.currentSegmentStartedAtMs = Date.now();
         const playedCount = this.activity.counters.segmentsPlayed + 1;
         this.activity.counters.segmentsPlayed = playedCount;
+        if (this.isReplaying) {
+          const idxMatch = msg.segment.segmentId.match(/^replay-\d+-(\d+)$/);
+          if (idxMatch) {
+            this.replayCurrentIndex = Number.parseInt(idxMatch[1], 10);
+            this.emitReplayStatus();
+          }
+          this.recordWhiteboardDirectives(msg.segment.directivesBefore);
+        }
         if (msg.segment.spokenText) {
           this.setPhase('speaking');
           this.deps.whiteboard.postMessage({
@@ -481,6 +595,7 @@ export class ReviewSession {
           {
             segmentId: msg.segment.segmentId,
             textLen: msg.segment.spokenText.length,
+            isReplay: this.isReplaying,
             directivesBefore: msg.segment.directivesBefore.map((d) =>
               d.type === 'code_goto'
                 ? { type: d.type, file: d.file, lines: d.lines, view: d.view }
@@ -491,7 +606,9 @@ export class ReviewSession {
           },
           msg.segment.turnId
         );
-        await this.applyHostDirectives(msg.segment.directivesBefore);
+        await this.applyHostDirectives(msg.segment.directivesBefore, {
+          isReplay: this.isReplaying,
+        });
         const totalPlanned = Math.max(this.activity.counters.segmentsParsed, playedCount);
         const speakDetail =
           this.currentChapter?.title ||
@@ -500,8 +617,9 @@ export class ReviewSession {
         this.updateActivity(
           {
             stage: this.activity.stage === 'audio_blocked' ? 'audio_blocked' : 'speaking',
-            headline:
-              this.activity.stage === 'audio_blocked'
+            headline: this.isReplaying
+              ? `重放同步中 (${playedCount}/${totalPlanned} 段)`
+              : this.activity.stage === 'audio_blocked'
                 ? `字幕同步推进中 (${playedCount}/${totalPlanned} 段 · 点击白板解锁语音)`
                 : `正在同步讲解 (${playedCount}/${totalPlanned} 段)`,
             detail: speakDetail,
@@ -509,9 +627,15 @@ export class ReviewSession {
           },
           {
             force: true,
-            statusBarSummary: `讲解 ${playedCount}/${totalPlanned} 段`,
+            statusBarSummary: `${this.isReplaying ? '重放' : '讲解'} ${playedCount}/${totalPlanned} 段`,
           }
         );
+        if (!this.isReplaying && !this.paused && !this.promptRunning) {
+          if (this.remainingUnplayedInWebview() <= PREFETCH_FLUSH_LOW_WATERMARK) {
+            this.flushNextPrefetchedChunk();
+          }
+          this.maybeStartPrefetch();
+        }
         return;
       }
 
@@ -523,7 +647,18 @@ export class ReviewSession {
         if (this.currentPlayingSegment?.segmentId === msg.segment.segmentId) {
           this.currentPlayingSegment = undefined;
         }
-        await this.applyHostDirectives(msg.segment.directivesAfter);
+        if (this.isReplaying) {
+          this.recordWhiteboardDirectives(msg.segment.directivesAfter);
+        }
+        await this.applyHostDirectives(msg.segment.directivesAfter, {
+          isReplay: this.isReplaying,
+        });
+        if (!this.isReplaying && !this.paused && !this.promptRunning) {
+          if (this.remainingUnplayedInWebview() <= PREFETCH_FLUSH_LOW_WATERMARK) {
+            this.flushNextPrefetchedChunk();
+          }
+          this.maybeStartPrefetch();
+        }
         return;
       }
 
@@ -537,21 +672,77 @@ export class ReviewSession {
           text: '',
           isSpeaking: false,
         });
-        if (!this.promptRunning && (this.phase === 'speaking' || this.phase === 'paused')) {
-          this.setPhase('idle', '等待你的提问，可随时直接开口或点击白板节点');
+        if (this.isReplaying) {
+          this.isReplaying = false;
+          this.replayCurrentIndex = -1;
+          this.emitReplayStatus();
+          this.setPhase('idle', '重放完成，可随时提问或再次重放');
           this.updateActivity(
             {
               stage: 'idle',
-              headline: '本轮导读完成，可随时提问或点击白板节点',
+              headline: '重放完成，可随时提问或再次重放',
               detail: undefined,
               currentFile: undefined,
             },
             {
-              logText: '本轮导读播报完成',
+              logText: '同步重放完成',
               force: true,
               statusBarSummary: '',
             }
           );
+          return;
+        }
+        if (!this.promptRunning) {
+          if (!this.paused && this.flushNextPrefetchedChunk()) {
+            return;
+          }
+          if (!this.paused && this.prefetchRunning) {
+            this.setPhase('thinking', '正在衔接下一章节...');
+            this.updateActivity(
+              {
+                stage: 'thinking',
+                headline: '正在衔接下一章节...',
+                detail: undefined,
+                currentFile: undefined,
+              },
+              {
+                statusBarSummary: '衔接下一章...',
+              }
+            );
+            return;
+          }
+          if (!this.paused && this.canAutoContinue()) {
+            this.setPhase('thinking', '正在生成下一章节...');
+            this.updateActivity(
+              {
+                stage: 'thinking',
+                headline: '正在生成下一章节...',
+                detail: undefined,
+                currentFile: undefined,
+              },
+              {
+                statusBarSummary: '准备下一章...',
+              }
+            );
+            this.maybeStartPrefetch(true);
+            return;
+          }
+          if (this.phase === 'speaking' || this.phase === 'paused' || this.phase === 'thinking') {
+            this.setPhase('idle', '等待你的提问，可随时直接开口或点击白板节点');
+            this.updateActivity(
+              {
+                stage: 'idle',
+                headline: '本轮导读完成，可随时提问或点击白板节点',
+                detail: undefined,
+                currentFile: undefined,
+              },
+              {
+                logText: '本轮导读播报完成',
+                force: true,
+                statusBarSummary: '',
+              }
+            );
+          }
         }
         return;
       }
@@ -594,6 +785,14 @@ export class ReviewSession {
               statusBarSummary: '继续讲解',
             }
           );
+          if (!this.isReplaying && !this.promptRunning) {
+            if (this.remainingUnplayedInWebview() <= PREFETCH_FLUSH_LOW_WATERMARK) {
+              this.flushNextPrefetchedChunk();
+            }
+            this.maybeStartPrefetch();
+          }
+        } else if (!this.isReplaying && !this.promptRunning && this.flushNextPrefetchedChunk()) {
+          this.setPhase('speaking');
         } else {
           this.setPhase('idle', '等待你的提问，可随时直接开口或点击白板节点');
           this.updateActivity(
@@ -643,18 +842,31 @@ export class ReviewSession {
       }
 
       case 'whiteboard:popTo': {
-        if (msg.index >= 0 && msg.index < this.diagramStack.length) {
-          this.activeDiagramIndex = msg.index;
-          this.deps.whiteboard.postMessage({
-            type: 'whiteboard:syncStack',
-            stack: this.diagramStack,
-            activeIndex: this.activeDiagramIndex,
-          });
+        const nextTree = selectWhiteboardIndex(this.diagramTree, msg.index);
+        if (nextTree !== this.diagramTree) {
+          this.diagramTree = nextTree;
+          this.postSyncWhiteboardTree();
+          const { stack } = deriveActivePath(this.diagramTree);
           this.deps.logger?.log('ui.interaction', {
             action: 'whiteboard_select_level',
             index: msg.index,
-            stackLength: this.diagramStack.length,
-            diagramId: this.diagramStack[this.activeDiagramIndex]?.id,
+            stackLength: stack.length,
+            totalNodes: this.diagramTree.nodes.length,
+            diagramId: this.diagramTree.activeId,
+          });
+        }
+        return;
+      }
+
+      case 'whiteboard:selectLayer': {
+        const nextTree = selectWhiteboardLayer(this.diagramTree, msg.id);
+        if (nextTree !== this.diagramTree) {
+          this.diagramTree = nextTree;
+          this.postSyncWhiteboardTree();
+          this.deps.logger?.log('ui.interaction', {
+            action: 'whiteboard_select_layer',
+            diagramId: this.diagramTree.activeId,
+            totalNodes: this.diagramTree.nodes.length,
           });
         }
         return;
@@ -707,6 +919,36 @@ export class ReviewSession {
         return;
       }
 
+      case 'ui:toggleAutoContinue': {
+        this.autoContinueEnabled = msg.enabled;
+        this.deps.logger?.log('ui.interaction', {
+          action: 'toggle_auto_continue',
+          enabled: msg.enabled,
+        });
+        if (!msg.enabled) {
+          this.cancelPrefetch();
+        } else if (
+          !this.paused &&
+          !this.promptRunning &&
+          !this.isReplaying &&
+          (this.activity.counters.segmentsPlayed > 0 || this.currentPlayingSegment !== undefined)
+        ) {
+          this.maybeStartPrefetch();
+        }
+        this.emitSessionState(this.phase);
+        return;
+      }
+
+      case 'replay:start': {
+        this.startReplay(msg.mode, msg.startIndex);
+        return;
+      }
+
+      case 'replay:stop': {
+        this.stopReplay();
+        return;
+      }
+
       case 'ui:switchTarget': {
         await this.deps.actions.onSwitchTarget();
         return;
@@ -714,6 +956,11 @@ export class ReviewSession {
 
       case 'ui:startBranchExplore': {
         await this.deps.actions.onStartBranchExplore?.();
+        return;
+      }
+
+      case 'ui:startCorePathReview': {
+        await this.deps.actions.onStartCorePathReview?.();
         return;
       }
 
@@ -810,6 +1057,7 @@ export class ReviewSession {
           error: msg.error,
           mermaidCode: msg.mermaidCode.slice(0, 1200),
         });
+        this.scheduleMermaidAutoRepair(msg.diagramId, msg.error, msg.mermaidCode);
         return;
       }
 
@@ -1029,7 +1277,16 @@ export class ReviewSession {
       cutoff.turnId
     );
 
+    const wasReplaying = this.isReplaying;
+    if (this.isReplaying) {
+      this.isReplaying = false;
+      this.replayCurrentIndex = -1;
+      this.emitReplayStatus();
+    }
     this.stopCurrentPlaybackAndPrompt();
+    if (wasReplaying) {
+      this.deps.logger?.log('replay.interrupted', { diagramId: diagramState.diagramId });
+    }
     this.setPhase('listening', '已打断，请继续提问...');
     this.updateActivity(
       {
@@ -1056,6 +1313,9 @@ export class ReviewSession {
     this.micActive = false;
     this.micUserSpeaking = false;
     this.micBackend = undefined;
+    this.isReplaying = false;
+    this.replayCurrentIndex = -1;
+    this.replayTimeline = [];
     this.stopCurrentPlaybackAndPrompt();
     this.deps.acpClient.dispose();
   }
@@ -1411,8 +1671,11 @@ export class ReviewSession {
       return;
     }
 
-    // If user submitted text/voice while previous turn is still active without prior barge-in
-    if (!this.pendingInterruption && (this.promptRunning || this.currentPlayingSegment)) {
+    // If user submitted text/voice while previous turn / replay is still active without prior barge-in
+    if (
+      !this.pendingInterruption &&
+      (this.promptRunning || this.currentPlayingSegment || this.isReplaying)
+    ) {
       this.pendingInterruption = this.buildInterruptionSnapshot(
         {
           turnId: this.activeTurnId,
@@ -1421,18 +1684,34 @@ export class ReviewSession {
         },
         this.getDiagramStateSnapshot()
       );
+      if (this.isReplaying) {
+        this.isReplaying = false;
+        this.replayCurrentIndex = -1;
+        this.emitReplayStatus();
+      }
       this.stopCurrentPlaybackAndPrompt();
+    } else {
+      this.cancelPrefetch();
     }
+
+    this.walkthroughDone = false;
+    this.autoContinueCount = 0;
 
     const effectiveNode = selectedNodeId ?? this.selectedNodeId;
     const hadInterruption = Boolean(this.pendingInterruption);
+    const promptMode = this.isCorePathLineReviewTarget()
+      ? 'core-path-line-review'
+      : this.target.kind === 'branch-explore'
+        ? 'branch-explore'
+        : 'diff';
     let promptText: string;
 
     if (this.pendingInterruption) {
       promptText = buildInterruptionPrompt(
         this.pendingInterruption,
         text,
-        effectiveNode
+        effectiveNode,
+        promptMode
       );
       this.pendingInterruption = undefined;
     } else {
@@ -1442,10 +1721,11 @@ export class ReviewSession {
         selectedNodeId: effectiveNode,
         diagramId: diagState.diagramId,
         stackPath: diagState.stackPath,
+        treeOutline: diagState.treeOutline,
         editorFile: editorLoc?.file,
         editorLines: editorLoc?.lines,
         notesCount: this.deps.comments.listDrafts().length,
-        mode: this.target.kind === 'branch-explore' ? 'branch-explore' : 'diff',
+        mode: promptMode,
       });
     }
 
@@ -1460,6 +1740,8 @@ export class ReviewSession {
   ): Promise<void> {
     this.activeTurnId += 1;
     const turnId = this.activeTurnId;
+    const turnGroupId = ++this.replayGroupSeq;
+    let activeGroupId = turnGroupId;
     const abortCtrl = new AbortController();
     this.activeTurnAbort = abortCtrl;
     this.promptRunning = true;
@@ -1469,6 +1751,7 @@ export class ReviewSession {
     this.turnSegments = [];
     this.playedSegmentIds.clear();
     this.currentPlayingSegment = undefined;
+    this.enqueuedSegmentCount = 0;
 
     const turnStartMs = Date.now();
     let firstTokenRecorded = false;
@@ -1599,17 +1882,27 @@ export class ReviewSession {
               }
             );
           }
+          const payload: AudioSegmentPayload = {
+            segment: entry.segment,
+            audioBase64: audioResult.audioBase64,
+            mimeType: audioResult.mimeType,
+            ttsRate: this.config.ttsRate,
+            fallbackTextOnly: audioResult.fallbackTextOnly,
+            muted: this.ttsMuted,
+          };
+          const hasChapterDir = entry.segment.directivesBefore.some(
+            (d) => d.type === 'chapter'
+          );
+          if (hasChapterDir) {
+            activeGroupId = ++this.replayGroupSeq;
+          }
+          this.recordTimelineEntry(payload, activeGroupId);
+          this.enqueuedSegmentCount += 1;
           this.deps.whiteboard.postMessage({
             type: 'audio:enqueue',
-            payload: {
-              segment: entry.segment,
-              audioBase64: audioResult.audioBase64,
-              mimeType: audioResult.mimeType,
-              ttsRate: this.config.ttsRate,
-              fallbackTextOnly: audioResult.fallbackTextOnly,
-              muted: this.ttsMuted,
-            },
+            payload,
           });
+          this.emitReplayStatus();
         }
       } finally {
         draining = false;
@@ -1620,13 +1913,25 @@ export class ReviewSession {
       if (turnId !== this.activeTurnId || abortCtrl.signal.aborted) {
         return;
       }
+      for (const dir of [...segment.directivesBefore, ...segment.directivesAfter]) {
+        directiveCounts[dir.type] = (directiveCounts[dir.type] ?? 0) + 1;
+        if (dir.type === 'walkthrough_done') {
+          this.walkthroughDone = true;
+        }
+      }
+
+      if (
+        !segment.spokenText.trim() &&
+        segment.directivesBefore.every((d) => d.type === 'walkthrough_done') &&
+        segment.directivesAfter.every((d) => d.type === 'walkthrough_done')
+      ) {
+        return;
+      }
+
       this.turnSegments.push(segment);
       this.activity.counters.segmentsParsed += 1;
       this.recordWhiteboardDirectives(segment.directivesBefore);
       this.recordWhiteboardDirectives(segment.directivesAfter);
-      for (const dir of [...segment.directivesBefore, ...segment.directivesAfter]) {
-        directiveCounts[dir.type] = (directiveCounts[dir.type] ?? 0) + 1;
-      }
 
       const ttsText = normalizeTextForTts(segment.spokenText);
       if (
@@ -1955,20 +2260,28 @@ export class ReviewSession {
     } finally {
       if (turnId === this.activeTurnId) {
         this.promptRunning = false;
+        if (!abortCtrl.signal.aborted) {
+          if (!this.drainPendingMermaidRepair()) {
+            this.maybeStartPrefetch();
+          }
+        }
       }
     }
   }
 
   private stopCurrentPlaybackAndPrompt(): void {
-    const hadActiveTurn = this.activeTurnId > 0 || this.promptRunning;
+    const hadActiveTurn = this.activeTurnId > 0 || this.promptRunning || this.isReplaying;
     const wasPromptRunning = this.promptRunning;
     this.activeTurnId += 1;
+    this.cancelPrefetch();
+    this.cancelMermaidRepair();
     if (this.activeTurnAbort) {
       this.activeTurnAbort.abort();
       this.activeTurnAbort = null;
     }
     this.promptRunning = false;
     this.paused = false;
+    this.enqueuedSegmentCount = 0;
     if (wasPromptRunning) {
       this.deps.acpClient.cancel();
     }
@@ -2010,7 +2323,10 @@ export class ReviewSession {
     this.emitSessionState(this.phase);
   }
 
-  private async applyHostDirectives(directives: Directive[]): Promise<void> {
+  private async applyHostDirectives(
+    directives: Directive[],
+    opts?: { isReplay?: boolean }
+  ): Promise<void> {
     if (!this.target) {
       return;
     }
@@ -2068,7 +2384,12 @@ export class ReviewSession {
         }
         this.syncCallChainActiveForLocation(dir.file, dir.lines?.start);
         this.emitSessionState(this.phase);
+      } else if (dir.type === 'walkthrough_done') {
+        this.walkthroughDone = true;
       } else if (dir.type === 'review_note') {
+        if (opts?.isReplay) {
+          continue;
+        }
         const activeLoc = this.getActiveEditorLocation();
         const effectiveFile =
           dir.file.trim() ||
@@ -2190,19 +2511,19 @@ export class ReviewSession {
     }
   }
 
-  private getClampedDiagramIndex(): number {
-    if (this.diagramStack.length === 0) {
-      return -1;
-    }
-    if (this.activeDiagramIndex < 0) {
-      return this.diagramStack.length - 1;
-    }
-    return Math.min(this.activeDiagramIndex, this.diagramStack.length - 1);
+  private postSyncWhiteboardTree(): void {
+    const { stack, activeIndex } = deriveActivePath(this.diagramTree);
+    this.deps.whiteboard.postMessage({
+      type: 'whiteboard:syncStack',
+      stack,
+      activeIndex,
+      nodes: this.diagramTree.nodes,
+      activeId: this.diagramTree.activeId,
+    });
   }
 
   private getActiveDiagram(): DiagramStackItem | undefined {
-    const idx = this.getClampedDiagramIndex();
-    return idx >= 0 ? this.diagramStack[idx] : undefined;
+    return getActiveTreeDiagram(this.diagramTree);
   }
 
   private findMappedCodeForNode(
@@ -2246,8 +2567,8 @@ export class ReviewSession {
       return activeHit;
     }
 
-    for (let i = this.diagramStack.length - 1; i >= 0; i--) {
-      const hit = lookupInMap(this.diagramStack[i].nodeCodeMap);
+    for (let i = this.diagramTree.nodes.length - 1; i >= 0; i--) {
+      const hit = lookupInMap(this.diagramTree.nodes[i].nodeCodeMap);
       if (hit) {
         return hit;
       }
@@ -2258,38 +2579,23 @@ export class ReviewSession {
 
   private recordWhiteboardDirectives(directives: Directive[]): void {
     for (const dir of directives) {
-      if (dir.type === 'wb_render') {
-        const item: DiagramStackItem = {
-          id: dir.id,
-          title: dir.title,
-          mermaidCode: dir.mermaidCode,
-          nodeCodeMap: dir.nodeCodeMap,
-        };
-        if (dir.mode === 'push' && this.diagramStack.length > 0) {
-          const anchor = this.getClampedDiagramIndex();
-          this.diagramStack = [...this.diagramStack.slice(0, anchor + 1), item];
-          this.activeDiagramIndex = this.diagramStack.length - 1;
-        } else {
-          this.diagramStack = [item];
-          this.activeDiagramIndex = 0;
-        }
-        this.diagramArchive.push(item);
-      } else if (dir.type === 'wb_focus') {
-        const active = this.getActiveDiagram();
-        if (active) {
-          active.focusedNodeId = dir.id;
-          active.focusedEdge = dir.edge;
-        }
-      } else if (dir.type === 'wb_pop') {
-        const currentIdx = this.getClampedDiagramIndex();
-        if (currentIdx > 0) {
-          this.activeDiagramIndex = currentIdx - 1;
-        }
-      } else if (dir.type === 'wb_clear') {
-        const active = this.getActiveDiagram();
-        if (active) {
-          active.focusedNodeId = undefined;
-          active.focusedEdge = undefined;
+      if (
+        dir.type === 'wb_render' ||
+        dir.type === 'wb_focus' ||
+        dir.type === 'wb_pop' ||
+        dir.type === 'wb_clear'
+      ) {
+        this.diagramTree = applyWhiteboardDirective(this.diagramTree, dir);
+        if (dir.type === 'wb_render') {
+          const active = getActiveTreeDiagram(this.diagramTree);
+          if (active) {
+            const idx = this.diagramArchive.findIndex((d) => d.id === active.id);
+            if (idx >= 0) {
+              this.diagramArchive[idx] = active;
+            } else {
+              this.diagramArchive.push(active);
+            }
+          }
         }
       } else if (dir.type === 'chapter') {
         this.currentChapter = {
@@ -2361,6 +2667,7 @@ export class ReviewSession {
       diagramId?: string;
       focusedNodeId?: string;
       stackPath: string;
+      treeOutline?: string;
     }
   ): InterruptionSnapshot {
     const spokenParts: string[] = [];
@@ -2397,6 +2704,7 @@ export class ReviewSession {
       diagramId: diagramState.diagramId,
       focusedNodeId: diagramState.focusedNodeId,
       stackPath: diagramState.stackPath,
+      treeOutline: diagramState.treeOutline ?? (formatWhiteboardTreeOutline(this.diagramTree) || undefined),
       editorState: this.getActiveEditorLocation(),
     };
   }
@@ -2414,8 +2722,10 @@ export class ReviewSession {
     if (!matchedNodeId || active.focusedNodeId === matchedNodeId) {
       return matchedNodeId;
     }
-    active.focusedNodeId = matchedNodeId;
-    active.focusedEdge = undefined;
+    this.diagramTree = applyWhiteboardDirective(this.diagramTree, {
+      type: 'wb_focus',
+      id: matchedNodeId,
+    });
     this.deps.whiteboard.postMessage({
       type: 'directive:apply',
       directive: { type: 'wb_focus', id: matchedNodeId },
@@ -2427,14 +2737,20 @@ export class ReviewSession {
     diagramId?: string;
     focusedNodeId?: string;
     stackPath: string;
+    treeOutline?: string;
   } {
-    const idx = this.getClampedDiagramIndex();
-    const active = idx >= 0 ? this.diagramStack[idx] : undefined;
-    const visiblePath = idx >= 0 ? this.diagramStack.slice(0, idx + 1) : this.diagramStack;
+    const { stack, activeIndex } = deriveActivePath(this.diagramTree);
+    const active =
+      activeIndex >= 0 && activeIndex < stack.length
+        ? stack[activeIndex]
+        : getActiveTreeDiagram(this.diagramTree);
+    const visiblePath = activeIndex >= 0 ? stack.slice(0, activeIndex + 1) : stack;
+    const treeOutline = formatWhiteboardTreeOutline(this.diagramTree);
     return {
       diagramId: active?.id,
       focusedNodeId: active?.focusedNodeId,
       stackPath: visiblePath.map((d) => d.title || d.id).join(' > '),
+      treeOutline: treeOutline || undefined,
     };
   }
 
@@ -2617,6 +2933,11 @@ export class ReviewSession {
       targetSubtitle:
         this.target?.subtitle ?? '可直接基于当前分支开始导读，或点击「切换目标」选择 PR / Diff',
       sourceKind: this.target?.kind ?? 'local-diff',
+      reviewMode: this.isCorePathLineReviewTarget()
+        ? 'core-path-line-review'
+        : this.target?.kind === 'branch-explore'
+          ? 'branch-explore'
+          : 'walkthrough',
       acpProfileLabel: `${this.config.acpProfile.displayName}${modelSuffix}`,
       viewMode:
         this.target?.kind === 'branch-explore'
@@ -2627,6 +2948,7 @@ export class ReviewSession {
       vadSilenceMs: this.config.vadSilenceMs,
       isPoppedOut: this.deps.whiteboard.getPoppedOut?.() ?? false,
       ttsMuted: this.ttsMuted,
+      autoContinue: this.autoContinueEnabled,
       activeEditorFile: activeLoc?.file,
       activeEditorLabel,
     };
@@ -2638,6 +2960,809 @@ export class ReviewSession {
       meta,
     });
   }
+
+  public startReplay(
+    mode: 'from-start' | 'current-section' | 'from-index',
+    explicitIndex?: number
+  ): void {
+    if (this.replayTimeline.length === 0) {
+      this.deps.whiteboard.postMessage({
+        type: 'notice:toast',
+        level: 'info',
+        message: '当前会话尚无可供重放的历史讲解片段。',
+      });
+      return;
+    }
+
+    const status = this.buildReplayStatus();
+    let resolvedStart = 0;
+    if (mode === 'from-index' && explicitIndex !== undefined) {
+      resolvedStart = Math.max(0, Math.min(explicitIndex, this.replayTimeline.length - 1));
+    } else if (mode === 'current-section') {
+      const refIdx =
+        this.replayCurrentIndex >= 0
+          ? this.replayCurrentIndex
+          : this.replayTimeline.length - 1;
+      const matchingCheckpoint = [...status.checkpoints]
+        .reverse()
+        .find((cp) => refIdx >= cp.startIndex);
+      resolvedStart = matchingCheckpoint?.startIndex ?? 0;
+    }
+
+    this.stopCurrentPlaybackAndPrompt();
+    this.isReplaying = true;
+    this.replayCurrentIndex = resolvedStart;
+    this.turnSegments = [];
+    this.playedSegmentIds.clear();
+    this.currentPlayingSegment = undefined;
+    this.enqueuedSegmentCount = 0;
+
+    if (resolvedStart === 0) {
+      this.diagramTree = createEmptyWhiteboardTree();
+      this.currentCallChain = null;
+      this.currentChapter = undefined;
+    } else {
+      const preState = this.replayTimeline[resolvedStart].preState;
+      this.diagramTree = cloneWhiteboardTreeState(preState.diagramTree);
+      this.currentCallChain = preState.callChain
+        ? cloneCallChainState(preState.callChain)
+        : null;
+      this.currentChapter = preState.chapter ? { ...preState.chapter } : undefined;
+    }
+
+    this.postSyncWhiteboardTree();
+    this.deps.whiteboard.postMessage({
+      type: 'callChain:sync',
+      chain: this.currentCallChain,
+    });
+    if (this.currentChapter) {
+      this.deps.whiteboard.postMessage({
+        type: 'chapter:update',
+        chapter: this.currentChapter,
+      });
+    }
+
+    const slice = this.replayTimeline.slice(resolvedStart);
+    this.activity.counters = {
+      ...this.activity.counters,
+      segmentsParsed: slice.length,
+      ttsReady: slice.length,
+      segmentsPlayed: 0,
+    };
+    this.setPhase('speaking', `开始同步重放 (${resolvedStart + 1}/${this.replayTimeline.length})`);
+    this.updateActivity(
+      {
+        stage: 'speaking',
+        headline: `同步重放中 (0/${slice.length} 段)`,
+        detail: this.replayTimeline[resolvedStart]?.groupTitle,
+      },
+      {
+        logText: `开始同步重放 (${mode}, 第 ${resolvedStart + 1} 段起，共 ${slice.length} 段)`,
+        force: true,
+        statusBarSummary: `重放 0/${slice.length}`,
+      }
+    );
+    this.emitReplayStatus();
+
+    const replayTurnId = this.activeTurnId;
+    for (const item of slice) {
+      const clonedSegment: UtteranceSegment = {
+        ...item.payload.segment,
+        turnId: replayTurnId,
+        segmentId: `replay-${replayTurnId}-${item.index}`,
+        directivesBefore: [...item.payload.segment.directivesBefore],
+        directivesAfter: [...item.payload.segment.directivesAfter],
+      };
+      this.turnSegments.push(clonedSegment);
+      this.enqueuedSegmentCount += 1;
+      this.deps.whiteboard.postMessage({
+        type: 'audio:enqueue',
+        payload: {
+          ...item.payload,
+          segment: clonedSegment,
+          ttsRate: this.config.ttsRate,
+          muted: this.ttsMuted,
+        },
+      });
+    }
+  }
+
+  public stopReplay(): void {
+    if (!this.isReplaying) {
+      return;
+    }
+    this.isReplaying = false;
+    this.replayCurrentIndex = -1;
+    this.stopCurrentPlaybackAndPrompt();
+    this.setPhase('idle', '已停止重放，可随时提问或点击白板节点');
+    this.updateActivity(
+      {
+        stage: 'idle',
+        headline: '已停止重放',
+        detail: undefined,
+        currentFile: undefined,
+      },
+      {
+        logText: '已手动停止重放',
+        force: true,
+        statusBarSummary: '',
+      }
+    );
+    this.emitReplayStatus();
+  }
+
+  private remainingUnplayedInWebview(): number {
+    return Math.max(0, this.enqueuedSegmentCount - this.playedSegmentIds.size);
+  }
+
+  private canAutoContinue(): boolean {
+    return Boolean(
+      this.target &&
+        this.autoContinueEnabled &&
+        !this.paused &&
+        !this.isReplaying &&
+        !this.walkthroughDone &&
+        !this.pendingBranchContextIntro &&
+        this.autoContinueCount < MAX_AUTO_CONTINUE_CHUNKS
+    );
+  }
+
+  private maybeStartPrefetch(forceWhenEmpty = false): void {
+    if (
+      !this.canAutoContinue() ||
+      this.promptRunning ||
+      this.prefetchRunning ||
+      this.mermaidRepairRunning ||
+      this.pendingMermaidRepair !== null ||
+      this.prefetchChunks.length >= PREFETCH_MAX_BUFFERED_CHUNKS
+    ) {
+      return;
+    }
+    const playbackStarted =
+      this.activity.counters.segmentsPlayed > 0 ||
+      this.currentPlayingSegment !== undefined;
+    if (!forceWhenEmpty && !playbackStarted) {
+      return;
+    }
+    void this.runPrefetchChunk();
+  }
+
+  private cancelPrefetch(): void {
+    const wasRunning = this.prefetchRunning;
+    this.prefetchGeneration += 1;
+    if (this.prefetchAbort) {
+      this.prefetchAbort.abort();
+      this.prefetchAbort = null;
+    }
+    this.prefetchRunning = false;
+    this.prefetchChunks = [];
+    if (wasRunning) {
+      this.deps.acpClient.cancel();
+    }
+  }
+
+  private async runPrefetchChunk(): Promise<void> {
+    if (!this.target) {
+      return;
+    }
+    const gen = ++this.prefetchGeneration;
+    const targetTurnId = this.activeTurnId;
+    const chunkNumber = ++this.autoContinueChunkSeq;
+    const abortCtrl = new AbortController();
+    this.prefetchAbort = abortCtrl;
+    this.prefetchRunning = true;
+
+    const promptMode = this.isCorePathLineReviewTarget()
+      ? 'core-path-line-review'
+      : this.target.kind === 'branch-explore'
+        ? 'branch-explore'
+        : 'diff';
+    const editorLoc = this.getActiveEditorLocation();
+    const promptText = buildAutoContinuePrompt({
+      mode: promptMode,
+      treeOutline: this.projectDiagramTreeWithBuffer(),
+      lastEditorFile: editorLoc?.file,
+      lastEditorLines: editorLoc?.lines,
+      lastChapterTitle: this.currentChapter?.title,
+      chunkNumber,
+    });
+
+    const localParser = new DirectiveParser(targetTurnId);
+    const localEntries: TurnSynthesisEntry[] = [];
+    let localSeq = 0;
+    let activeSynth = 0;
+    const synthQueue: Array<() => void> = [];
+    let chunkDone = false;
+
+    const runWithConcurrency = <T>(fn: () => Promise<T>): Promise<T> => {
+      return new Promise<T>((resolve, reject) => {
+        const exec = () => {
+          if (
+            abortCtrl.signal.aborted ||
+            gen !== this.prefetchGeneration ||
+            targetTurnId !== this.activeTurnId
+          ) {
+            reject(new Error('Prefetch aborted'));
+            return;
+          }
+          activeSynth += 1;
+          fn()
+            .then(resolve, reject)
+            .finally(() => {
+              activeSynth -= 1;
+              const next = synthQueue.shift();
+              if (next) {
+                next();
+              }
+            });
+        };
+        if (activeSynth < MAX_TTS_CONCURRENCY) {
+          exec();
+        } else {
+          synthQueue.push(exec);
+        }
+      });
+    };
+
+    const enqueueLocal = (seg: UtteranceSegment): void => {
+      if (
+        abortCtrl.signal.aborted ||
+        gen !== this.prefetchGeneration ||
+        targetTurnId !== this.activeTurnId
+      ) {
+        return;
+      }
+      for (const dir of [...seg.directivesBefore, ...seg.directivesAfter]) {
+        if (dir.type === 'walkthrough_done') {
+          chunkDone = true;
+        }
+      }
+      if (
+        !seg.spokenText.trim() &&
+        seg.directivesBefore.every((d) => d.type === 'walkthrough_done') &&
+        seg.directivesAfter.every((d) => d.type === 'walkthrough_done')
+      ) {
+        return;
+      }
+      localSeq += 1;
+      const stamped: UtteranceSegment = {
+        ...seg,
+        turnId: targetTurnId,
+        segmentId: `t${targetTurnId}-c${chunkNumber}-s${localSeq}`,
+      };
+      const ttsText = normalizeTextForTts(stamped.spokenText);
+      const promise =
+        this.ttsMuted || !ttsText
+          ? Promise.resolve<TtsAudioResult>({
+              audioBase64: '',
+              mimeType: '',
+              fallbackTextOnly: true,
+            })
+          : runWithConcurrency(() =>
+              this.deps.speech.synthesizeWithFallback(ttsText, {
+                voice: this.config.ttsVoice,
+                rate: this.config.ttsRate,
+                signal: abortCtrl.signal,
+              })
+            );
+      localEntries.push({ segment: stamped, promise });
+    };
+
+    this.deps.logger?.log(
+      'prefetch.start',
+      { chunkNumber, mode: promptMode },
+      targetTurnId
+    );
+
+    try {
+      await this.deps.acpClient.sendPrompt(promptText, {
+        onTextDelta: (delta) => {
+          if (
+            abortCtrl.signal.aborted ||
+            gen !== this.prefetchGeneration ||
+            targetTurnId !== this.activeTurnId
+          ) {
+            return;
+          }
+          for (const seg of localParser.feed(delta)) {
+            enqueueLocal(seg);
+          }
+        },
+        onThoughtDelta: () => undefined,
+        onToolActivity: () => undefined,
+      });
+
+      if (
+        abortCtrl.signal.aborted ||
+        gen !== this.prefetchGeneration ||
+        targetTurnId !== this.activeTurnId
+      ) {
+        return;
+      }
+
+      for (const seg of localParser.flush()) {
+        enqueueLocal(seg);
+      }
+
+      const payloads: AudioSegmentPayload[] = [];
+      for (const entry of localEntries) {
+        if (
+          abortCtrl.signal.aborted ||
+          gen !== this.prefetchGeneration ||
+          targetTurnId !== this.activeTurnId
+        ) {
+          return;
+        }
+        let audioResult: TtsAudioResult;
+        try {
+          audioResult = await entry.promise;
+        } catch {
+          if (
+            abortCtrl.signal.aborted ||
+            gen !== this.prefetchGeneration ||
+            targetTurnId !== this.activeTurnId
+          ) {
+            return;
+          }
+          audioResult = { audioBase64: '', mimeType: '', fallbackTextOnly: true };
+        }
+        payloads.push({
+          segment: entry.segment,
+          audioBase64: audioResult.audioBase64,
+          mimeType: audioResult.mimeType,
+          ttsRate: this.config.ttsRate,
+          fallbackTextOnly: audioResult.fallbackTextOnly,
+          muted: this.ttsMuted,
+        });
+      }
+
+      if (
+        abortCtrl.signal.aborted ||
+        gen !== this.prefetchGeneration ||
+        targetTurnId !== this.activeTurnId
+      ) {
+        return;
+      }
+
+      this.prefetchRunning = false;
+      this.prefetchAbort = null;
+
+      if (payloads.length === 0) {
+        this.walkthroughDone = true;
+        this.deps.logger?.log('prefetch.empty', { chunkNumber }, targetTurnId);
+        if (!this.currentPlayingSegment && this.phase === 'thinking') {
+          this.setPhase('idle', '全部导读已完成，可随时提问或点击重放');
+          this.updateActivity(
+            { stage: 'idle', headline: '导读已全部完成，可随时提问或重放' },
+            { force: true, statusBarSummary: '' }
+          );
+        }
+        return;
+      }
+
+      this.prefetchChunks.push({ payloads, walkthroughDone: chunkDone });
+      this.autoContinueCount += 1;
+      this.deps.logger?.log(
+        'prefetch.ready',
+        { chunkNumber, segmentCount: payloads.length, walkthroughDone: chunkDone },
+        targetTurnId
+      );
+
+      if (
+        !this.paused &&
+        !this.isReplaying &&
+        (this.remainingUnplayedInWebview() <= PREFETCH_FLUSH_LOW_WATERMARK ||
+          (!this.currentPlayingSegment && this.phase === 'thinking'))
+      ) {
+        this.flushNextPrefetchedChunk();
+      }
+      this.drainPendingMermaidRepair();
+    } catch (err) {
+      if (gen !== this.prefetchGeneration || targetTurnId !== this.activeTurnId) {
+        return;
+      }
+      this.prefetchRunning = false;
+      this.prefetchAbort = null;
+      this.deps.logger?.log(
+        'prefetch.error',
+        { chunkNumber, message: err instanceof Error ? err.message : String(err) },
+        targetTurnId
+      );
+      if (!this.drainPendingMermaidRepair()) {
+        if (!this.currentPlayingSegment && this.phase === 'thinking') {
+          this.setPhase('idle', '等待你的提问，可随时直接开口或点击白板节点');
+          this.updateActivity(
+            { stage: 'idle', headline: '本轮导读完成，可随时提问或点击白板节点' },
+            { force: true, statusBarSummary: '' }
+          );
+        }
+      }
+    }
+  }
+
+  private flushNextPrefetchedChunk(): boolean {
+    if (this.paused || this.isReplaying || this.prefetchChunks.length === 0) {
+      return false;
+    }
+    const chunk = this.prefetchChunks.shift()!;
+    if (chunk.walkthroughDone) {
+      this.walkthroughDone = true;
+    }
+
+    let groupId = ++this.replayGroupSeq;
+    for (const rawPayload of chunk.payloads) {
+      const seg: UtteranceSegment = {
+        ...rawPayload.segment,
+        turnId: this.activeTurnId,
+      };
+      if (seg.directivesBefore.some((d) => d.type === 'chapter')) {
+        groupId = ++this.replayGroupSeq;
+      }
+      const payload: AudioSegmentPayload = {
+        ...rawPayload,
+        segment: seg,
+        ttsRate: this.config.ttsRate,
+        muted: this.ttsMuted,
+      };
+      this.turnSegments.push(seg);
+      this.activity.counters.segmentsParsed += 1;
+      this.activity.counters.ttsReady += 1;
+      this.recordWhiteboardDirectives(seg.directivesBefore);
+      this.recordWhiteboardDirectives(seg.directivesAfter);
+      this.recordTimelineEntry(payload, groupId);
+      this.enqueuedSegmentCount += 1;
+      this.deps.whiteboard.postMessage({
+        type: 'audio:enqueue',
+        payload,
+      });
+    }
+
+    this.emitReplayStatus();
+    if (this.canAutoContinue()) {
+      this.maybeStartPrefetch();
+    }
+    return true;
+  }
+
+  private recordTimelineEntry(payload: AudioSegmentPayload, groupId: number): void {
+    const preState: ReplayPreStateSnapshot = {
+      diagramTree: cloneWhiteboardTreeState(this.replayShadowTree),
+      callChain: this.replayShadowCallChain
+        ? cloneCallChainState(this.replayShadowCallChain)
+        : null,
+      chapter: this.replayShadowChapter ? { ...this.replayShadowChapter } : undefined,
+    };
+
+    const allDirs = [...payload.segment.directivesBefore, ...payload.segment.directivesAfter];
+    for (const dir of allDirs) {
+      if (
+        dir.type === 'wb_render' ||
+        dir.type === 'wb_focus' ||
+        dir.type === 'wb_pop' ||
+        dir.type === 'wb_clear'
+      ) {
+        this.replayShadowTree = applyWhiteboardDirective(this.replayShadowTree, dir);
+      } else if (dir.type === 'chapter') {
+        this.replayShadowChapter = {
+          index: dir.index,
+          total: dir.total,
+          title: dir.title,
+        };
+      } else if (dir.type === 'call_chain') {
+        this.replayShadowCallChain = {
+          title: dir.title,
+          nodes: dir.nodes.map((n) => ({ ...n })),
+          activeIndex: dir.activeIndex,
+          source: 'agent',
+        };
+      }
+    }
+
+    const activeDiag = getActiveTreeDiagram(this.replayShadowTree);
+    const groupTitle =
+      this.replayShadowChapter?.title ||
+      activeDiag?.title ||
+      `片段 #${this.replayTimeline.length + 1}`;
+
+    this.replayTimeline.push({
+      index: this.replayTimeline.length,
+      groupId,
+      groupTitle,
+      payload: {
+        ...payload,
+        segment: {
+          ...payload.segment,
+          directivesBefore: [...payload.segment.directivesBefore],
+          directivesAfter: [...payload.segment.directivesAfter],
+        },
+      },
+      preState,
+    });
+  }
+
+  private buildReplayStatus(): ReplayStatusState {
+    const checkpoints: ReplayCheckpoint[] = [];
+    for (const entry of this.replayTimeline) {
+      const prev = checkpoints[checkpoints.length - 1];
+      if (!prev || this.replayTimeline[prev.startIndex].groupId !== entry.groupId) {
+        checkpoints.push({
+          startIndex: entry.index,
+          segmentCount: 1,
+          title: entry.groupTitle,
+        });
+      } else {
+        prev.segmentCount += 1;
+        prev.title = entry.groupTitle || prev.title;
+      }
+    }
+    return {
+      totalSegments: this.replayTimeline.length,
+      isReplaying: this.isReplaying,
+      currentIndex: this.isReplaying ? this.replayCurrentIndex : undefined,
+      checkpoints,
+    };
+  }
+
+  private emitReplayStatus(): void {
+    this.deps.whiteboard.postMessage({
+      type: 'replay:status',
+      status: this.buildReplayStatus(),
+    });
+  }
+
+  private projectDiagramTreeWithBuffer(): string | undefined {
+    let projected = cloneWhiteboardTreeState(this.diagramTree);
+    for (const chunk of this.prefetchChunks) {
+      for (const p of chunk.payloads) {
+        for (const dir of [...p.segment.directivesBefore, ...p.segment.directivesAfter]) {
+          if (
+            dir.type === 'wb_render' ||
+            dir.type === 'wb_focus' ||
+            dir.type === 'wb_pop' ||
+            dir.type === 'wb_clear'
+          ) {
+            projected = applyWhiteboardDirective(projected, dir);
+          }
+        }
+      }
+    }
+    return formatWhiteboardTreeOutline(projected) || undefined;
+  }
+
+  private scheduleMermaidAutoRepair(
+    diagramId: string | undefined,
+    error: string,
+    mermaidCode: string
+  ): void {
+    if (!this.target || this.isReplaying) {
+      return;
+    }
+    const targetId = diagramId?.trim() || this.getActiveDiagram()?.id;
+    if (!targetId) {
+      return;
+    }
+    const usedAttempts = this.mermaidRepairAttempts.get(targetId) ?? 0;
+    if (usedAttempts >= MAX_MERMAID_REPAIR_ATTEMPTS) {
+      this.deps.logger?.log('whiteboard.mermaid_repair_exhausted', {
+        diagramId: targetId,
+        attempts: usedAttempts,
+      });
+      return;
+    }
+    if (this.promptRunning || this.prefetchRunning || this.mermaidRepairRunning) {
+      this.pendingMermaidRepair = { diagramId: targetId, error, mermaidCode };
+      this.deps.logger?.log('whiteboard.mermaid_repair_queued', {
+        diagramId: targetId,
+        usedAttempts,
+      });
+      return;
+    }
+    void this.runMermaidRepair({ diagramId: targetId, error, mermaidCode });
+  }
+
+  private drainPendingMermaidRepair(): boolean {
+    if (
+      !this.pendingMermaidRepair ||
+      this.promptRunning ||
+      this.prefetchRunning ||
+      this.mermaidRepairRunning ||
+      this.isReplaying
+    ) {
+      return false;
+    }
+    const next = this.pendingMermaidRepair;
+    this.pendingMermaidRepair = null;
+    this.scheduleMermaidAutoRepair(next.diagramId, next.error, next.mermaidCode);
+    return true;
+  }
+
+  private cancelMermaidRepair(): void {
+    const wasRunning = this.mermaidRepairRunning;
+    this.mermaidRepairGeneration += 1;
+    if (this.mermaidRepairAbort) {
+      this.mermaidRepairAbort.abort();
+      this.mermaidRepairAbort = null;
+    }
+    this.mermaidRepairRunning = false;
+    this.pendingMermaidRepair = null;
+    if (wasRunning) {
+      this.deps.acpClient.cancel();
+    }
+  }
+
+  private async runMermaidRepair(req: {
+    diagramId: string;
+    error: string;
+    mermaidCode: string;
+  }): Promise<void> {
+    if (!this.target) {
+      return;
+    }
+    const attempt = (this.mermaidRepairAttempts.get(req.diagramId) ?? 0) + 1;
+    this.mermaidRepairAttempts.set(req.diagramId, attempt);
+
+    const gen = ++this.mermaidRepairGeneration;
+    const turnId = this.activeTurnId;
+    const abortCtrl = new AbortController();
+    this.mermaidRepairAbort = abortCtrl;
+    this.mermaidRepairRunning = true;
+
+    const existingNode = this.diagramTree.nodes.find((n) => n.id === req.diagramId);
+    const existingTitle = existingNode?.title || req.diagramId;
+
+    const repairPrompt = buildMermaidRepairPrompt({
+      diagramId: req.diagramId,
+      title: existingTitle,
+      error: req.error,
+      brokenMermaidCode: req.mermaidCode,
+    });
+
+    this.deps.logger?.log(
+      'whiteboard.mermaid_repair_start',
+      { diagramId: req.diagramId, attempt },
+      turnId
+    );
+
+    const localParser = new DirectiveParser(turnId);
+    let rawResponseText = '';
+    const parsedSegments: UtteranceSegment[] = [];
+
+    try {
+      await this.deps.acpClient.sendPrompt(repairPrompt, {
+        onTextDelta: (delta) => {
+          if (
+            abortCtrl.signal.aborted ||
+            gen !== this.mermaidRepairGeneration ||
+            turnId !== this.activeTurnId
+          ) {
+            return;
+          }
+          rawResponseText += delta;
+          parsedSegments.push(...localParser.feed(delta));
+        },
+        onThoughtDelta: () => undefined,
+        onToolActivity: () => undefined,
+      });
+
+      if (
+        abortCtrl.signal.aborted ||
+        gen !== this.mermaidRepairGeneration ||
+        turnId !== this.activeTurnId
+      ) {
+        return;
+      }
+
+      parsedSegments.push(...localParser.flush());
+      const wbDirectives = parsedSegments
+        .flatMap((s) => [...s.directivesBefore, ...s.directivesAfter])
+        .filter((d): d is WbRenderDirective => d.type === 'wb_render');
+
+      let fixedDir: WbRenderDirective | undefined = wbDirectives[wbDirectives.length - 1];
+      if (!fixedDir) {
+        const sanitizedFallback = sanitizeMermaidCode(rawResponseText);
+        if (sanitizedFallback) {
+          fixedDir = {
+            type: 'wb_render',
+            id: req.diagramId,
+            targetId: req.diagramId,
+            title: existingTitle,
+            mode: 'update',
+            mermaidCode: sanitizedFallback,
+            nodeCodeMap: existingNode?.nodeCodeMap,
+          };
+        }
+      }
+
+      if (fixedDir) {
+        const normalizedFixed: WbRenderDirective = {
+          ...fixedDir,
+          type: 'wb_render',
+          id: req.diagramId,
+          targetId: req.diagramId,
+          title: fixedDir.title || existingTitle,
+          mode: 'update',
+          nodeCodeMap: fixedDir.nodeCodeMap ?? existingNode?.nodeCodeMap,
+        };
+        this.recordWhiteboardDirectives([normalizedFixed]);
+        this.patchReplayTimelineDiagram(normalizedFixed);
+        this.postSyncWhiteboardTree();
+        this.deps.logger?.log(
+          'whiteboard.mermaid_repaired',
+          { diagramId: req.diagramId, attempt },
+          turnId
+        );
+      } else {
+        this.deps.logger?.log(
+          'whiteboard.mermaid_repair_empty',
+          { diagramId: req.diagramId, attempt },
+          turnId
+        );
+      }
+    } catch (err) {
+      if (gen === this.mermaidRepairGeneration && turnId === this.activeTurnId) {
+        this.deps.logger?.log(
+          'whiteboard.mermaid_repair_error',
+          {
+            diagramId: req.diagramId,
+            attempt,
+            message: err instanceof Error ? err.message : String(err),
+          },
+          turnId
+        );
+      }
+    } finally {
+      if (gen === this.mermaidRepairGeneration) {
+        this.mermaidRepairRunning = false;
+        this.mermaidRepairAbort = null;
+        if (!this.drainPendingMermaidRepair()) {
+          this.maybeStartPrefetch();
+        }
+      }
+    }
+  }
+
+  private patchReplayTimelineDiagram(fixed: WbRenderDirective): void {
+    this.replayShadowTree = applyWhiteboardDirective(this.replayShadowTree, fixed);
+    for (const entry of this.replayTimeline) {
+      entry.payload.segment.directivesBefore = entry.payload.segment.directivesBefore.map(
+        (d) => (d.type === 'wb_render' && d.id === fixed.id ? { ...fixed } : d)
+      );
+      entry.payload.segment.directivesAfter = entry.payload.segment.directivesAfter.map(
+        (d) => (d.type === 'wb_render' && d.id === fixed.id ? { ...fixed } : d)
+      );
+      entry.preState.diagramTree = {
+        ...entry.preState.diagramTree,
+        nodes: entry.preState.diagramTree.nodes.map((n) =>
+          n.id === fixed.id
+            ? {
+                ...n,
+                title: fixed.title || n.title,
+                mermaidCode: fixed.mermaidCode,
+                nodeCodeMap: fixed.nodeCodeMap ?? n.nodeCodeMap,
+              }
+            : n
+        ),
+      };
+    }
+  }
+}
+
+function cloneWhiteboardTreeState(tree: WhiteboardTreeState): WhiteboardTreeState {
+  return {
+    nodes: tree.nodes.map((n) => ({
+      ...n,
+      nodeCodeMap: n.nodeCodeMap ? { ...n.nodeCodeMap } : undefined,
+    })),
+    activeId: tree.activeId,
+    lastChildByParent: { ...tree.lastChildByParent },
+  };
+}
+
+function cloneCallChainState(chain: CallChainState): CallChainState {
+  return {
+    ...chain,
+    nodes: chain.nodes.map((n) => ({ ...n })),
+  };
 }
 
 export function findNodeIdForFile(

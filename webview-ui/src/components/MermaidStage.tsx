@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import mermaid from 'mermaid';
 import svgPanZoom from 'svg-pan-zoom';
-import { Compass, GitBranch, Maximize2, ZoomIn, ZoomOut } from 'lucide-react';
+import { Compass, GitBranch, ListTree, Maximize2, ZoomIn, ZoomOut } from 'lucide-react';
 import type { DiagramStackItem } from '../../../src/shared/protocol';
 
 interface MermaidStageProps {
@@ -9,6 +9,7 @@ interface MermaidStageProps {
   selectedNodeId?: string;
   onSelectNode: (nodeId?: string) => void;
   onDoubleClickNode: (nodeId: string, codeTarget?: string) => void;
+  onStartCorePathReview?: () => void;
   onStartBranchExplore?: () => void;
   onSwitchTarget?: () => void;
   onParseError?: (info: {
@@ -28,6 +29,7 @@ export const MermaidStage: React.FC<MermaidStageProps> = ({
   selectedNodeId,
   onSelectNode,
   onDoubleClickNode,
+  onStartCorePathReview,
   onStartBranchExplore,
   onSwitchTarget,
   onParseError,
@@ -150,7 +152,9 @@ export const MermaidStage: React.FC<MermaidStageProps> = ({
       } catch (err) {
         if (!cancelled) {
           const msg = err instanceof Error ? err.message : String(err);
-          setParseWarning(`白板图形语法容错降级（保留上一帧）：${msg.slice(0, 80)}`);
+          setParseWarning(
+            `白板图形语法异常（保留上一帧，正在自动通知 Agent 修复重写...）：${msg.slice(0, 80)}`
+          );
           onParseErrorRef.current?.({
             diagramId: diagramIdRef.current,
             error: msg,
@@ -381,10 +385,21 @@ export const MermaidStage: React.FC<MermaidStageProps> = ({
             可直接基于当前分支按指令 Review 代码或全局架构导读（无需选 PR），也可以选择本地 Branch Diff 或 Bitbucket PR 进行对比复盘。
           </div>
           <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, justifyContent: 'center', marginTop: 4 }}>
-            {onStartBranchExplore && (
+            {onStartCorePathReview && (
               <button
                 type="button"
                 className="ra-btn active"
+                onClick={onStartCorePathReview}
+                title="指定输入或当前光标入口，沿核心链路逐行审核心分支并自动跳入子方法深化白板"
+              >
+                <ListTree size={14} />
+                <span>核心链路逐行 Review</span>
+              </button>
+            )}
+            {onStartBranchExplore && (
+              <button
+                type="button"
+                className={`ra-btn ${onStartCorePathReview ? '' : 'active'}`}
                 onClick={onStartBranchExplore}
               >
                 <Compass size={14} />

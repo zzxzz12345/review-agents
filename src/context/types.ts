@@ -47,7 +47,18 @@ export interface BitbucketPrTarget {
   pr: BitbucketPrMetadata;
 }
 
-export type BranchExploreStartMode = 'instruction' | 'auto-overview' | 'standby';
+export type BranchExploreStartMode =
+  | 'instruction'
+  | 'auto-overview'
+  | 'standby'
+  | 'core-path-line-review';
+
+export interface CorePathEntryHint {
+  file: string;
+  line: number;
+  endLine?: number;
+  selectedSnippet?: string;
+}
 
 export interface BranchExploreTarget {
   kind: 'branch-explore';
@@ -61,6 +72,7 @@ export interface BranchExploreTarget {
   subtitle: string;
   initialInstruction?: string;
   startMode: BranchExploreStartMode;
+  entryHint?: CorePathEntryHint;
 }
 
 export interface RepoOverviewSummary {

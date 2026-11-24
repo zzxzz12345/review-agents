@@ -2759,21 +2759,109 @@ describe('ReviewSession orchestration & exact barge-in', () => {
       totalDeletions: 2,
       moduleClusters: [],
       chapters: [],
-      files: [
-        {
-          path: 'libs/strategy/v84.py',
-          status: 'M',
-          additions: 12,
-          deletions: 2,
-          isBinary: false,
-          isIgnored: false,
-          moduleGroup: 'libs',
-          hunkHeaders: ['@@ -1,4 +1,8 @@', '@@ -175,6 +179,14 @@ class V84'],
-          touchedSymbols: ['def _on_split (L179)'],
-          compactDiff: '',
-        },
-      ],
+        files: [
+          {
+            path: 'libs/strategy/v84.py',
+            status: 'M',
+            additions: 12,
+            deletions: 2,
+            isBinary: false,
+            isIgnored: false,
+            moduleGroup: 'libs',
+            hunkHeaders: ['@@ -1,4 +1,8 @@', '@@ -175,6 +179,14 @@ class V84'],
+            touchedSymbols: ['def _on_split (L179)'],
+            compactDiff: '',
+          },
+        ],
     });
     expect(resolved).toEqual({ start: 179, end: 186 });
+  });
+
+  it('provides export timeline snapshot, pre-renders SVGs via webview bridge, and triggers export action', async () => {
+    const sentMessages: HostToWebviewMessage[] = [];
+    const onExportSpy = vi.fn().mockResolvedValue(undefined);
+
+    const session = new ReviewSession(
+      {
+        acpClient: {
+          connect: vi.fn().mockResolvedValue({
+            initResult: { protocolVersion: 1 },
+            sessionResult: { sessionId: 's-export' },
+            configOptions: [],
+            modelResolution: {
+              requestedThoughtLevel: 'low',
+              resolvedModel: 'gemini-4-hydrogen',
+              resolvedThoughtLevel: 'low',
+              matchedRequestedModel: true,
+              availableModels: ['gemini-4-hydrogen'],
+            },
+          }),
+          sendPrompt: vi.fn(async (_text: string, cb: AcpPromptCallbacks): Promise<AcpPromptResult> => {
+            cb.onTextDelta(
+              '<chapter index="1" total="1" title="Overview"/>' +
+                '<wb_render id="ov" title="总览" mode="replace">flowchart LR\n  A-->B\n</wb_render>' +
+                '<code_goto file="src/auth.ts" lines="10-15" label="verify"/>' +
+                '我们看第一段核心校验。'
+            );
+            return { stopReason: 'end_turn' };
+          }),
+          cancel: vi.fn(),
+          dispose: vi.fn(),
+        },
+        contextPackBuilder: { build: vi.fn().mockResolvedValue(SAMPLE_PACK) },
+        speech: {
+          synthesizeWithFallback: vi.fn(async (text: string) => ({
+            audioBase64: Buffer.from(text).toString('base64'),
+            mimeType: 'audio/mpeg',
+          })),
+          transcribe: vi.fn().mockResolvedValue(''),
+        },
+        whiteboard: {
+          openOrReveal: vi.fn(),
+          popOutToWindow: vi.fn().mockResolvedValue(undefined),
+          postMessage: (msg) => {
+            sentMessages.push(msg);
+            if (msg.type === 'export:renderDiagrams') {
+              void session.handleWebviewMessage({
+                type: 'export:diagramsRendered',
+                requestId: msg.requestId,
+                svgs: { [msg.diagrams[0].key]: '<svg id="ok"></svg>' },
+              });
+            }
+          },
+        },
+        codeNavigator: {
+          navigateTo: vi.fn().mockResolvedValue({ file: 'src/auth.ts', lines: { start: 10, end: 15 }, view: 'source' }),
+          toggleViewMode: vi.fn().mockResolvedValue('source'),
+          getCurrentViewMode: () => 'source',
+          getCurrentLocation: () => undefined,
+        },
+        comments: { addDraft: vi.fn(), listDrafts: () => [], clear: vi.fn() },
+        actions: {
+          onSwitchTarget: vi.fn().mockResolvedValue(undefined),
+          onPublishOrExportNotes: vi.fn().mockResolvedValue(undefined),
+          onExportHtmlWalkthrough: onExportSpy,
+        },
+      },
+      BASE_CONFIG
+    );
+
+    await session.start(SAMPLE_TARGET);
+    await new Promise((r) => setTimeout(r, 40));
+
+    const snap = session.getExportTimelineSnapshot();
+    expect(snap.reviewMode).toBe('walkthrough');
+    expect(snap.timeline).toHaveLength(1);
+    expect(snap.timeline[0].payload.segment.spokenText).toContain('核心校验');
+
+    const svgs = await session.requestRenderedDiagramSvgs([
+      { key: 'diag_1', mermaidCode: 'flowchart LR\n  A-->B' },
+    ]);
+    expect(svgs).toEqual({ diag_1: '<svg id="ok"></svg>' });
+
+    await session.handleWebviewMessage({ type: 'ui:exportHtmlWalkthrough' });
+    expect(onExportSpy).toHaveBeenCalledTimes(1);
+
+    session.dispose();
   });
 });

@@ -341,6 +341,11 @@ export type HostToWebviewMessage =
   | {
       type: 'replay:status';
       status: ReplayStatusState;
+    }
+  | {
+      type: 'export:renderDiagrams';
+      requestId: string;
+      diagrams: Array<{ key: string; mermaidCode: string }>;
     };
 
 export type WebviewToHostMessage =
@@ -382,6 +387,12 @@ export type WebviewToHostMessage =
   | { type: 'ui:startBranchExplore' }
   | { type: 'ui:startCorePathReview' }
   | { type: 'ui:publishOrExportNotes' }
+  | { type: 'ui:exportHtmlWalkthrough' }
+  | {
+      type: 'export:diagramsRendered';
+      requestId: string;
+      svgs: Record<string, string>;
+    }
   | {
       type: 'replay:start';
       mode: 'from-start' | 'current-section' | 'from-index';

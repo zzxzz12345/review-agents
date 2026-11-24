@@ -22,6 +22,7 @@ import type {
   ReplayStatusState,
   ReviewNoteDraft,
   SessionMetaState,
+  ReviewModeStyle,
   SessionPhase,
   UtteranceSegment,
   VoiceMode,
@@ -151,6 +152,7 @@ export interface ReviewSessionDependencies {
     onAutoStartBranchExplore?: (initialInstruction: string) => Promise<void>;
     getActiveEditorRelPath?: (repoRoot: string) => string | undefined;
     onPublishOrExportNotes: () => Promise<void>;
+    onExportHtmlWalkthrough?: () => Promise<void>;
     onPhaseChanged?: (
       phase: SessionPhase,
       targetTitle?: string,
@@ -254,6 +256,11 @@ export class ReviewSession {
     error: string;
     mermaidCode: string;
   } | null = null;
+  private exportSvgSeq = 0;
+  private pendingSvgExports = new Map<
+    string,
+    { resolve: (svgs: Record<string, string>) => void; timer: NodeJS.Timeout }
+  >();
 
   // Extension Host native microphone tracking
   private micActive = false;
@@ -293,12 +300,62 @@ export class ReviewSession {
     );
   }
 
+  private getReviewModeStyle(): ReviewModeStyle {
+    return this.isCorePathLineReviewTarget()
+      ? 'core-path-line-review'
+      : this.target?.kind === 'branch-explore'
+        ? 'branch-explore'
+        : 'walkthrough';
+  }
+
   public get currentContextPack(): ReviewContextPack | undefined {
     return this.contextPack;
   }
 
   public get collectedDiagrams(): DiagramStackItem[] {
     return [...this.diagramArchive];
+  }
+
+  public getExportTimelineSnapshot(): {
+    timeline: ReplayTimelineEntry[];
+    reviewMode: ReviewModeStyle;
+  } {
+    return {
+      timeline: this.replayTimeline.map((item) => ({
+        ...item,
+        payload: {
+          ...item.payload,
+          segment: {
+            ...item.payload.segment,
+            directivesBefore: [...item.payload.segment.directivesBefore],
+            directivesAfter: [...item.payload.segment.directivesAfter],
+          },
+        },
+      })),
+      reviewMode: this.getReviewModeStyle(),
+    };
+  }
+
+  public requestRenderedDiagramSvgs(
+    diagrams: Array<{ key: string; mermaidCode: string }>,
+    timeoutMs = 6000
+  ): Promise<Record<string, string>> {
+    if (diagrams.length === 0) {
+      return Promise.resolve({});
+    }
+    const requestId = `svg-export-${++this.exportSvgSeq}-${Date.now()}`;
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.pendingSvgExports.delete(requestId);
+        resolve({});
+      }, timeoutMs);
+      this.pendingSvgExports.set(requestId, { resolve, timer });
+      this.deps.whiteboard.postMessage({
+        type: 'export:renderDiagrams',
+        requestId,
+        diagrams,
+      });
+    });
   }
 
   public updateConfig(next: ReviewSessionRuntimeConfig): void {
@@ -973,6 +1030,21 @@ export class ReviewSession {
         return;
       }
 
+      case 'ui:exportHtmlWalkthrough': {
+        await this.deps.actions.onExportHtmlWalkthrough?.();
+        return;
+      }
+
+      case 'export:diagramsRendered': {
+        const pending = this.pendingSvgExports.get(msg.requestId);
+        if (pending) {
+          clearTimeout(pending.timer);
+          this.pendingSvgExports.delete(msg.requestId);
+          pending.resolve(msg.svgs ?? {});
+        }
+        return;
+      }
+
       case 'ui:deleteNote': {
         if (this.deps.comments.removeDraft?.(msg.id)) {
           this.deps.logger?.log('ui.interaction', {
@@ -1309,6 +1381,11 @@ export class ReviewSession {
       clearTimeout(this.activityEmitTimer);
       this.activityEmitTimer = null;
     }
+    for (const pending of this.pendingSvgExports.values()) {
+      clearTimeout(pending.timer);
+      pending.resolve({});
+    }
+    this.pendingSvgExports.clear();
     this.deps.mic?.stop();
     this.micActive = false;
     this.micUserSpeaking = false;
@@ -2922,6 +2999,11 @@ export class ReviewSession {
       clearTimeout(this.activityEmitTimer);
       this.activityEmitTimer = null;
     }
+    for (const pending of this.pendingSvgExports.values()) {
+      clearTimeout(pending.timer);
+      pending.resolve({});
+    }
+    this.pendingSvgExports.clear();
     this.lastActivityEmitMs = Date.now();
     this.deps.whiteboard.postMessage({
       type: 'activity:update',
@@ -2959,11 +3041,7 @@ export class ReviewSession {
       targetSubtitle:
         this.target?.subtitle ?? '可直接基于当前分支开始导读，或点击「切换目标」选择 PR / Diff',
       sourceKind: this.target?.kind ?? 'local-diff',
-      reviewMode: this.isCorePathLineReviewTarget()
-        ? 'core-path-line-review'
-        : this.target?.kind === 'branch-explore'
-          ? 'branch-explore'
-          : 'walkthrough',
+      reviewMode: this.getReviewModeStyle(),
       acpProfileLabel: `${this.config.acpProfile.displayName}${modelSuffix}`,
       viewMode:
         this.target?.kind === 'branch-explore'

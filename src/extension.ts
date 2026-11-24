@@ -16,6 +16,10 @@ import type {
   ReviewTarget,
 } from './context/types';
 import {
+  buildWalkthroughExportBundle,
+  renderStandaloneWalkthroughHtml,
+} from './export/HtmlWalkthroughExporter';
+import {
   ReviewSession,
   type ReviewSessionRuntimeConfig,
 } from './orchestrator/ReviewSession';
@@ -242,6 +246,99 @@ export function activate(context: vscode.ExtensionContext): void {
         draftCount: drafts.length,
       });
     }
+  };
+
+  const exportHtmlWalkthroughFlow = async (): Promise<void> => {
+    if (!activeSession?.currentTarget) {
+      void vscode.window.showInformationMessage('当前没有进行中的 Review 会话。');
+      return;
+    }
+    const target = activeSession.currentTarget;
+    const { timeline, reviewMode } = activeSession.getExportTimelineSnapshot();
+    if (timeline.length === 0) {
+      void vscode.window.showInformationMessage('当前会话尚无可供导出的导读回放片段，请先开始导读。');
+      return;
+    }
+
+    const now = new Date();
+    const pad = (n: number) => String(n).padStart(2, '0');
+    const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}`;
+    const rawSlug = target.title
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 36);
+    const defaultName = `review-walkthrough-${rawSlug || 'session'}-${stamp}.html`;
+    const defaultUri = vscode.Uri.file(path.join(target.repoRoot, defaultName));
+
+    const saveUri = await vscode.window.showSaveDialog({
+      defaultUri,
+      filters: { 'Interactive HTML Walkthrough': ['html'] },
+      saveLabel: '导出 HTML 导读',
+    });
+    if (!saveUri) {
+      return;
+    }
+
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: '正在导出独立可播放 HTML 导读...',
+        cancellable: false,
+      },
+      async (progress) => {
+        progress.report({ message: '收集源码副本与渲染白板...' });
+        const bundle = await buildWalkthroughExportBundle({
+          target,
+          contextPack: activeSession?.currentContextPack,
+          reviewMode,
+          timeline,
+          notes: reviewComments.listDrafts(),
+          loadFileContent: async (relPath) => {
+            const diskPath = path.join(target.repoRoot, relPath);
+            if (target.headRef === 'HEAD') {
+              try {
+                return await fs.readFile(diskPath, 'utf8');
+              } catch {
+                return await gitService.getFileAtRef(target.repoRoot, target.headRef, relPath);
+              }
+            }
+            const atRef = await gitService.getFileAtRef(target.repoRoot, target.headRef, relPath);
+            if (atRef !== null) {
+              return atRef;
+            }
+            try {
+              return await fs.readFile(diskPath, 'utf8');
+            } catch {
+              return null;
+            }
+          },
+          renderDiagrams: async (diagrams) =>
+            (await activeSession?.requestRenderedDiagramSvgs(diagrams, 6000)) ?? {},
+        });
+
+        progress.report({ message: '生成独立 HTML 文件...' });
+        const html = renderStandaloneWalkthroughHtml(bundle);
+        await fs.writeFile(saveUri.fsPath, html, 'utf8');
+
+        usageLogger.log('export.html_walkthrough', {
+          stepCount: bundle.steps.length,
+          diagramCount: Object.keys(bundle.diagrams).length,
+          fileCount: Object.keys(bundle.files).length,
+        });
+
+        const picked = await vscode.window.showInformationMessage(
+          `已导出独立导读 HTML：${path.basename(saveUri.fsPath)}（${bundle.steps.length} 段语音 · ${Object.keys(bundle.files).length} 个只读代码副本）`,
+          '在浏览器中打开',
+          '在文件管理器中显示'
+        );
+        if (picked === '在浏览器中打开') {
+          await vscode.env.openExternal(saveUri);
+        } else if (picked === '在文件管理器中显示') {
+          await vscode.commands.executeCommand('revealFileInOS', saveUri);
+        }
+      }
+    );
   };
 
   let downloadingWhisperModel = false;
@@ -503,6 +600,7 @@ export function activate(context: vscode.ExtensionContext): void {
           return rel.replace(/\\/g, '/');
         },
         onPublishOrExportNotes: publishOrExportNotes,
+        onExportHtmlWalkthrough: exportHtmlWalkthroughFlow,
         onPhaseChanged: (phase, title, activitySummary) =>
           updateStatusBar(phase, title, activitySummary),
         onSttModelMissing: () => {
@@ -678,6 +776,9 @@ export function activate(context: vscode.ExtensionContext): void {
       usageLogger.log('notes.markdown_exported', {
         draftCount: reviewComments.listDrafts().length,
       });
+    }),
+    vscode.commands.registerCommand('reviewAgents.exportHtmlWalkthrough', async () => {
+      await exportHtmlWalkthroughFlow();
     }),
     vscode.commands.registerCommand('reviewAgents.stopSession', async () => {
       activeSession?.dispose();

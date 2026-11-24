@@ -71,6 +71,11 @@
         "title": "Review Agents: Export Markdown Review Report"
       },
       {
+        "command": "reviewAgents.exportHtmlWalkthrough",
+        "title": "Review Agents: Export Interactive HTML Walkthrough (导出独立可播放 HTML)",
+        "icon": "$(desktop-download)"
+      },
+      {
         "command": "reviewAgents.stopSession",
         "title": "Review Agents: End Review Session"
       },

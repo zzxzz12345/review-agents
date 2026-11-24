@@ -501,7 +501,7 @@ function centerElementInPanZoom(
   }
 }
 
-function sanitizeMermaidClient(raw: string): string {
+export function sanitizeMermaidClient(raw: string): string {
   return raw
     .trim()
     .replace(/^```(?:mermaid)?\s*\r?\n?/i, '')

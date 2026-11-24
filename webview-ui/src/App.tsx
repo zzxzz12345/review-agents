@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
+import mermaid from 'mermaid';
 import type {
   AgentActivityState,
   CallChainNode,
@@ -24,7 +25,7 @@ import {
 import { AgentActivityBar } from './components/AgentActivityBar';
 import { BreadcrumbStack } from './components/BreadcrumbStack';
 import { CallChainSidebar, type CallersEntryState } from './components/CallChainSidebar';
-import { MermaidStage } from './components/MermaidStage';
+import { MermaidStage, sanitizeMermaidClient } from './components/MermaidStage';
 import { NotesDrawer } from './components/NotesDrawer';
 import { SubtitleHud } from './components/SubtitleHud';
 import { TopToolbar } from './components/TopToolbar';
@@ -348,6 +349,61 @@ export const App: React.FC = () => {
         case 'replay:status':
           setReplayStatus(msg.status);
           return;
+        case 'export:renderDiagrams': {
+          void (async () => {
+            const svgs: Record<string, string> = {};
+            try {
+              mermaid.initialize({
+                startOnLoad: false,
+                theme: 'base',
+                themeVariables: {
+                  background: '#ffffff',
+                  primaryColor: '#eef2ff',
+                  primaryBorderColor: '#4f46e5',
+                  primaryTextColor: '#0f172a',
+                  secondaryColor: '#f1f5f9',
+                  tertiaryColor: '#f8fafc',
+                  lineColor: '#334155',
+                  edgeLabelBackground: '#ffffff',
+                  textColor: '#0f172a',
+                  noteBkgColor: '#fef9c3',
+                  noteTextColor: '#1e293b',
+                  noteBorderColor: '#eab308',
+                  fontSize: '14px',
+                },
+                securityLevel: 'loose',
+                flowchart: {
+                  useMaxWidth: false,
+                  htmlLabels: true,
+                  curve: 'basis',
+                },
+              });
+              for (let i = 0; i < msg.diagrams.length; i++) {
+                const item = msg.diagrams[i];
+                try {
+                  const cleaned = sanitizeMermaidClient(item.mermaidCode);
+                  if (!cleaned) continue;
+                  await mermaid.parse(cleaned);
+                  const renderId = `ra-export-${Date.now()}-${i}`;
+                  const rendered = await mermaid.render(renderId, cleaned);
+                  if (rendered?.svg) {
+                    svgs[item.key] = rendered.svg;
+                  }
+                } catch {
+                  // Leave unrendered diagrams to fallback gracefully
+                }
+              }
+            } catch {
+              // Ignore top-level init errors
+            }
+            postToHost({
+              type: 'export:diagramsRendered',
+              requestId: msg.requestId,
+              svgs,
+            });
+          })();
+          return;
+        }
       }
     });
 
@@ -444,6 +500,7 @@ export const App: React.FC = () => {
           postToHost({ type: 'replay:start', mode, startIndex })
         }
         onStopReplay={() => postToHost({ type: 'replay:stop' })}
+        onExportHtml={() => postToHost({ type: 'ui:exportHtmlWalkthrough' })}
         onToggleViewMode={() => postToHost({ type: 'ui:toggleViewMode' })}
         onToggleCallChain={() => {
           userSidebarOverrideRef.current = true;

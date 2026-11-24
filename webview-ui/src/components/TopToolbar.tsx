@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import {
   ChevronDown,
   Columns2,
+  Download,
   ExternalLink,
   FileCode2,
   GitBranch,
@@ -31,6 +32,7 @@ interface TopToolbarProps {
     startIndex?: number
   ) => void;
   onStopReplay?: () => void;
+  onExportHtml?: () => void;
   onToggleViewMode: () => void;
   onToggleCallChain?: () => void;
   onPopOutWindow: () => void;
@@ -60,6 +62,7 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
   replayStatus,
   onStartReplay,
   onStopReplay,
+  onExportHtml,
   onToggleViewMode,
   onToggleCallChain,
   onPopOutWindow,
@@ -187,6 +190,19 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
                       <span>停止重放</span>
                     </button>
                   )}
+                  {onExportHtml && (
+                    <button
+                      type="button"
+                      className="ra-tree-node-btn"
+                      onClick={() => {
+                        setReplayMenuOpen(false);
+                        onExportHtml();
+                      }}
+                    >
+                      <Download size={12} />
+                      <span>导出独立可播放 HTML</span>
+                    </button>
+                  )}
                   {replayStatus.checkpoints.length > 0 && (
                     <>
                       <div className="ra-replay-divider">按章节 / 检查点重放</div>
@@ -212,6 +228,18 @@ export const TopToolbar: React.FC<TopToolbarProps> = ({
               </div>
             )}
           </div>
+        )}
+
+        {hasReplay && onExportHtml && (
+          <button
+            type="button"
+            className="ra-btn"
+            onClick={onExportHtml}
+            title="将本次导读导出为可离线播放的独立 HTML（分屏代码 + 语音播报 + 白板）"
+          >
+            <Download size={14} />
+            <span>导出 HTML</span>
+          </button>
         )}
 
         {!isBranchExplore && (
